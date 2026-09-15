@@ -1,1 +1,1 @@
-# script that ingests data from excel and dumps to database tables 
+# script that dumps our data to database
