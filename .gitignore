@@ -3,3 +3,8 @@ CLAUDE.md
 .agents
 .claude
 skills-lock.json
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
