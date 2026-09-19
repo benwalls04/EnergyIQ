@@ -1,1 +1,0 @@
-# script that ingests data from excel and dumps to database tables 
