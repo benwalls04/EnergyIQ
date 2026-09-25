@@ -1,13 +1,26 @@
+# Secrets
+.env
 *.env
-CLAUDE.md
-.agents
-.claude
-skills-lock.json
-.venv/
-venv/
-env/
+
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data and generated files
+artifacts/
 *.duckdb
 *.duckdb.wal
-.vscode
+*.duckdb.tmp/
+
+# Editors and tools
+.vscode/
+.DS_Store
+.claude/
+.agents/
+CLAUDE.md
+skills-lock.json
