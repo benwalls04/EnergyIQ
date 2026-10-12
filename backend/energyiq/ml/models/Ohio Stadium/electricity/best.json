@@ -1,0 +1,12 @@
+{
+  "building": "Ohio Stadium",
+  "utility_type": "electricity",
+  "model_type": "hgb",
+  "half_life": null,
+  "trained_at": "20261011_203438",
+  "metrics": {
+    "MSE": 96.99066191378292,
+    "R2": 0.9127294558848922,
+    "MAE": 5.285869044570306
+  }
+}

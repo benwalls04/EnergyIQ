@@ -1,0 +1,12 @@
+{
+  "building": "Ohio Stadium",
+  "utility_type": "heat",
+  "model_type": "hgb",
+  "half_life": null,
+  "trained_at": "20261011_203502",
+  "metrics": {
+    "MSE": 408.9172159757243,
+    "R2": 0.19746127588683027,
+    "MAE": 15.229227007227646
+  }
+}

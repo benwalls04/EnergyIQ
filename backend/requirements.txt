@@ -3,3 +3,4 @@ duckdb-engine>=0.13
 sqlalchemy>=2.0
 pandas
 scikit-learn
+ipykernel
