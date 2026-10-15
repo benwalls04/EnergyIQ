@@ -1,0 +1,39 @@
+{
+  "building": "Scott House",
+  "utility_type": "electricity",
+  "model_type": "hgb",
+  "half_life": null,
+  "features": {
+    "inc_lags": true,
+    "inc_weekends": true,
+    "inc_breaks": true
+  },
+  "feature_columns": [
+    "temperature_2m",
+    "shortwave_radiation",
+    "dew_point_2m",
+    "precipitation",
+    "wind_speed_10m",
+    "cloud_cover",
+    "lag_24h",
+    "lag_168h",
+    "is_weekend",
+    "in_classes",
+    "hour_sin",
+    "hour_cos",
+    "meterid_246337",
+    "meterid_246338"
+  ],
+  "trained_at": "20261015_184820",
+  "metrics": {
+    "MSE": 15.287812467259844,
+    "RMSE": 3.9099632309345114,
+    "R2": 0.9081025899738573,
+    "MAE": 2.422846991516561,
+    "train_MAE": 2.0426350434183895,
+    "n_train": 63516,
+    "n_test": 63254,
+    "n_features": 14,
+    "fit_seconds": 4.230578599992441
+  }
+}

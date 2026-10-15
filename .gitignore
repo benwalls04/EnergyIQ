@@ -25,3 +25,6 @@ artifacts/
 .agents/
 CLAUDE.md
 skills-lock.json
+
+wandb/
+bash.exe.stackdump

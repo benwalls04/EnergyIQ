@@ -1,0 +1,39 @@
+{
+  "building": "Thompson Memorial Library",
+  "utility_type": "electricity",
+  "model_type": "hgb",
+  "half_life": null,
+  "features": {
+    "inc_lags": true,
+    "inc_weekends": true,
+    "inc_breaks": true
+  },
+  "feature_columns": [
+    "temperature_2m",
+    "shortwave_radiation",
+    "dew_point_2m",
+    "precipitation",
+    "wind_speed_10m",
+    "cloud_cover",
+    "lag_24h",
+    "lag_168h",
+    "is_weekend",
+    "in_classes",
+    "hour_sin",
+    "hour_cos",
+    "meterid_246374",
+    "meterid_246375"
+  ],
+  "trained_at": "20261015_185029",
+  "metrics": {
+    "MSE": 23.463137880627297,
+    "RMSE": 4.843876327965785,
+    "R2": 0.9872651355204185,
+    "MAE": 2.886771452504517,
+    "train_MAE": 2.1465685232104774,
+    "n_train": 42602,
+    "n_test": 63254,
+    "n_features": 14,
+    "fit_seconds": 2.3191231000237167
+  }
+}
