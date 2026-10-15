@@ -4,3 +4,4 @@ sqlalchemy>=2.0
 pandas
 scikit-learn
 ipykernel
+wandb
