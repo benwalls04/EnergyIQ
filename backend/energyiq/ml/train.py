@@ -5,6 +5,7 @@ import shutil
 import time
 from datetime import datetime
 from pathlib import Path
+import numpy as np
 import pandas as pd
 
 from sklearn.linear_model import LinearRegression, Ridge
@@ -14,10 +15,9 @@ from sklearn.metrics import (
     r2_score,
     mean_squared_error
 )
-from energyiq.ml.preprocess import preprocess
+from energyiq.ml.preprocess import preprocess, group_keys, TRAIN_END  # one split date shared with outlier removal
 
-# train: Sep 2024 - Aug 2025, test/replay: Sep 2025 - Aug 2026 (a full year each)
-TRAIN_END = "2025-09-01"
+# a test residual is an anomaly when it's more than this many times its group's training MAE
 # best from the stage-A search; model_params passed to train() override these
 HGB_DEFAULTS = {
     "random_state": 42,
@@ -33,8 +33,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train a model for a building")
 
     parser.add_argument(
-        "building",
-        help="Building to train on",
+        "--building",
+        choices=["All", "Ohio Stadium", "Thompson Memorial Library", "Scott House"],
+        default="All",
+        help="Building to train on: All, Ohio Stadium, Thompson Memorial Library, or Scott House",
     )
     parser.add_argument(
         "--model-type",
@@ -64,6 +66,12 @@ def parse_args():
         default=None,
         help="Time-decay half-life in days (default: no weighting)",
     )
+    parser.add_argument(
+        "--anomaly-k",
+        type=float,
+        default=3,
+        help=f"Flag test residuals above k x their group's training MAE (default: {3})",
+    )
 
     # feature flags passed through to preprocess
     shared = parser.add_argument_group("heat and electricity features")
@@ -78,6 +86,11 @@ def parse_args():
         "--seasons",
         action="store_true",
         help="Add one-hot season columns",
+    )
+    heat.add_argument(
+        "--months",
+        action="store_true",
+        help="Add a months flag",
     )
     heat.add_argument(
         "--temp-history",
@@ -100,6 +113,11 @@ def parse_args():
         "--breaks",
         action="store_true",
         help="Add an in_classes flag (0 during academic breaks)",
+    )
+    electricity.add_argument(
+        "--weekdays",
+        action="store_true",
+        help="Add a weekday flag",
     )
 
     return parser.parse_args()
@@ -131,25 +149,46 @@ def time_decay_weights(index, half_life_days):
     age_days = (index.max() - index) / pd.Timedelta(days=1)
     return 0.5 ** (age_days / half_life_days)
 
-def print_mae_breakdowns(X_test, y_test, y_pred):
-  """Test MAE per month and per meter, console output only."""
+def decode_one_hot(X, prefix, fallback):
+  """Category per row from its one-hot columns, or `fallback` if they were dropped as constant."""
+  cols = [c for c in X.columns if c.startswith(prefix)]
+  if cols:
+    return X[cols].idxmax(axis=1).str.removeprefix(prefix).to_numpy()
+  return pd.Series(fallback, index=X.index).to_numpy()
+
+def print_mae_breakdowns(X_test, y_test, y_pred, building, label="all rows"):
+  """Test MAE per building and month, and per building and meter, console output only."""
   abs_err = (y_test - y_pred).abs()
 
-  print("\nTest MAE by month:")
-  print(abs_err.groupby(abs_err.index.to_period("M")).mean().round(3).to_string())
+  # a single building or single-meter utility has no sitename/meterid columns left
+  buildings = decode_one_hot(X_test, "sitename_", building)
+  meters = decode_one_hot(X_test, "meterid_", "only meter")
 
-  # meterid is one-hot encoded; a single-meter utility has no meterid columns left
-  meter_cols = [c for c in X_test.columns if c.startswith("meterid_")]
-  if meter_cols:
-    meters = X_test[meter_cols].idxmax(axis=1).str.removeprefix("meterid_")
-  else:
-    meters = pd.Series("only meter", index=X_test.index)
+  print(f"\nTest MAE by month ({label}):")
+  by_month = abs_err.groupby([abs_err.index.to_period("M"), buildings]).mean()
+  print(by_month.unstack().round(3).to_string())  # months as rows, buildings as columns
 
-  print("\nTest MAE by meter:")
-  print(abs_err.groupby(meters.to_numpy()).mean().round(3).to_string())
+  print(f"\nTest MAE by meter ({label}):")
+  print(abs_err.groupby([buildings, meters]).mean().round(3).to_string())
+
+def flag_anomalies(X_train, train_resid, X_test, test_resid, utility_type, k):
+  """
+  True for test rows whose |residual| is more than k x the training MAE of their group
+  (meter + season for heat, meter + weekday + break for electricity). Thresholds come from
+  training residuals only, so no test information is used to decide what's anomalous.
+  """
+  train_keys = group_keys(decode_one_hot(X_train, "meterid_", "only meter"), X_train.index, utility_type)
+  test_keys = group_keys(decode_one_hot(X_test, "meterid_", "only meter"), X_test.index, utility_type)
+
+  group_mae = np.abs(train_resid).groupby(train_keys).mean()
+  thresholds = group_mae.reindex(pd.MultiIndex.from_arrays(test_keys)).to_numpy()
+  # a group never seen in training falls back to the overall training MAE
+  thresholds = np.where(np.isnan(thresholds), np.abs(train_resid).mean(), thresholds) * k
+
+  return np.abs(np.asarray(test_resid)) > thresholds
 
 def train(model_type, utility_type, building, log_metrics, half_life=None,
-          model_params=None, **features):
+          model_params=None, anomaly_k=3, **features):
   
   # linear models get one-hot hours, trees get sin/cos
   X, y = preprocess(building, utility_type, baseline=model_type != "hgb", **features)
@@ -181,14 +220,29 @@ def train(model_type, utility_type, building, log_metrics, half_life=None,
   model.fit(X_train, y_train, sample_weight=weights)
   fit_seconds = time.perf_counter() - start
   y_pred = model.predict(X_test)
+  train_pred = model.predict(X_train)
 
-  mse = mean_squared_error(y_test, y_pred)
+  # accuracy on the test rows that weren't flagged as anomalies
+  anomalous = flag_anomalies(X_train, y_train - train_pred, X_test, y_test - y_pred,
+                             utility_type, anomaly_k)
+  normal = ~anomalous
+  print(f"flagged {anomalous.sum()} of {len(y_test)} test rows as anomalies "
+        f"({anomalous.mean():.2%}, k={anomaly_k})")
+
+  mse =mean_squared_error(y_test, y_pred)
+  normal_mse = mean_squared_error(y_test[normal], y_pred[normal])
   metrics = {
     "MSE": mse,
     "RMSE": mse ** 0.5,
     "R2": r2_score(y_test, y_pred),
     "MAE": mean_absolute_error(y_test, y_pred),
-    "train_MAE": mean_absolute_error(y_train, model.predict(X_train)),
+    "train_MAE": mean_absolute_error(y_train, train_pred),
+    "anomaly_k": anomaly_k,
+    "n_anomalies": int(anomalous.sum()),
+    "anomaly_rate": anomalous.mean(),
+    "normal_MAE": mean_absolute_error(y_test[normal], y_pred[normal]),
+    "normal_RMSE": normal_mse ** 0.5,
+    "normal_R2": r2_score(y_test[normal], y_pred[normal]),
     "n_train": len(X_train),
     "n_test": len(X_test),
     "n_features": X.shape[1],
@@ -197,7 +251,9 @@ def train(model_type, utility_type, building, log_metrics, half_life=None,
 
   if log_metrics:
     print(metrics)
-    print_mae_breakdowns(X_test, y_test, y_pred)
+    print_mae_breakdowns(X_test, y_test, y_pred, building)
+    print_mae_breakdowns(X_test[normal], y_test[normal], y_pred[normal], building,
+                         label=f"anomalies removed, k={anomaly_k}")
 
   return model, metrics, list(X.columns)
 
@@ -211,6 +267,8 @@ if __name__=="__main__":
     "inc_lags": args.lags,
     "inc_weekends": args.weekends,
     "inc_breaks": args.breaks,
+    "inc_months": args.months,
+    "inc_weekdays": args.weekdays,
   }
   feature_kwargs = {name: True for name, on in all_flags.items() if on}
 
@@ -220,6 +278,7 @@ if __name__=="__main__":
     building=args.building,
     log_metrics=args.verbose,
     half_life=args.half_life,
+    anomaly_k=args.anomaly_k,
     **feature_kwargs,
   )
 

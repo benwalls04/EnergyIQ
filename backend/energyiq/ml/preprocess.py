@@ -3,6 +3,9 @@ import numpy as np
 from sqlalchemy import create_engine, text
 from energyiq import config
 
+# train: Sep 2024 - Aug 2025, test/replay: Sep 2025 - Aug 2026 (a full year each)
+TRAIN_END = "2025-09-01"
+
 BREAKS = [
     ("10/12/23", "10/13/23"), ("11/22/23", "11/24/23"), ("12/15/23", "1/7/24"),
     ("3/11/24", "3/15/24"),   ("5/1/24", "8/19/24"),
@@ -25,11 +28,13 @@ WEATHER_DROP = ["direct_radiation", "diffuse_radiation", "direct_normal_irradian
               "relative_humidity_2m", "apparent_temperature"]
 
 # columns from the DB join that are never features
-NON_FEATURE_COLS = ["id", "readingunits", "sitename", "latitude", "longitude",
+NON_FEATURE_COLS = ["id", "readingunits", "latitude", "longitude",
                     "building_id", "date", "utility"]
 
-# categorical columns that get one-hot encoded when present
-CATEGORICAL_COLS = ["meterid", "hour", "season"]
+# categorical columns that get one-hot encoded when present.
+# sitename is constant for a single building, so its dummy is dropped as a constant
+# column and only survives as a feature when training on All
+CATEGORICAL_COLS = ["meterid", "sitename", "hour", "season", "weekday", "month"]
 
 
 # ---------------------------------------------------------------- shared steps
@@ -39,27 +44,36 @@ def load_readings(building_name, utility_type):
     engine = create_engine(f"duckdb:///{config.DB_PATH}")
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT id FROM buildings WHERE sitename = :name"),
-                {"name": building_name},
-            ).first()
-            if row is None:
-                raise ValueError(f"No building named {building_name!r}")
+            if building_name != "All":
+                row = conn.execute(
+                    text("SELECT id FROM buildings WHERE sitename = :name"),
+                    {"name": building_name},
+                ).first()
+                if row is None:
+                    raise ValueError(f"No building named {building_name!r}")
 
-            df = pd.read_sql(text("""
-                SELECT m.*, b.sitename, w.*
-                FROM meter_readings m
-                JOIN buildings b ON m.building_id = b.id
-                JOIN weather w
-                  ON date_trunc('hour', m.readingtime) = date_trunc('hour', w.date)
-                WHERE m.building_id = :bId
-            """), conn, params={"bId": row[0]})
+                df = pd.read_sql(text("""
+                    SELECT m.*, b.sitename, w.*
+                    FROM meter_readings m
+                    JOIN buildings b ON m.building_id = b.id
+                    JOIN weather w
+                    ON date_trunc('hour', m.readingtime) = date_trunc('hour', w.date)
+                    WHERE m.building_id = :bId
+                """), conn, params={"bId": row[0]})
+            else: 
+                df = pd.read_sql(text("""
+                    SELECT m.*, b.sitename, w.*
+                    FROM meter_readings m
+                    JOIN buildings b ON m.building_id = b.id
+                    JOIN weather w
+                    ON date_trunc('hour', m.readingtime) = date_trunc('hour', w.date)
+                """), conn)
     finally:
         engine.dispose()
 
     df = df[df["utility"] == utility_type.upper()]
     if df.empty:
-        raise ValueError(f"No {utility_type} readings for {building_name}")
+        raise ValueError(f"No {utility_type} readings for {building_name} building")
     return df.drop(columns=WEATHER_DROP)
 
 def clean_zero_runs(df, col="readingvalue", group="meterid", max_fill=3):
@@ -67,11 +81,14 @@ def clean_zero_runs(df, col="readingvalue", group="meterid", max_fill=3):
     Zeros that come from meter dropouts, not real usage:
     - runs of <= max_fill consecutive zeros are interpolated from the neighbouring readings
     - longer runs (outages) are dropped
+    Training period only: in the test/replay period a run of zeros may be a real anomaly,
+    so those readings are left as they are.
     Assumes one reading per meter per 15-minute interval.
     """
     df = df.sort_values([group, "readingtime"]).reset_index(drop=True)
+    is_train = df["readingtime"] < TRAIN_END
 
-    is_zero = df[col].eq(0)
+    is_zero = df[col].eq(0) & is_train
     prev_zero = is_zero.groupby(df[group]).shift(fill_value=False)
     run_id = (is_zero != prev_zero).cumsum()
     run_len = is_zero.groupby([df[group], run_id]).transform("size")
@@ -79,24 +96,50 @@ def clean_zero_runs(df, col="readingvalue", group="meterid", max_fill=3):
     short = is_zero & (run_len <= max_fill)
     long = is_zero & (run_len > max_fill)
 
+    # interpolate within the training period only, and only write back the short-run zeros,
+    # so test readings are never filled or used to fill
     df.loc[short, col] = np.nan
-    df[col] = df.groupby(group)[col].transform(
+    filled = df.groupby([df[group], is_train])[col].transform(
         lambda s: s.interpolate(limit=max_fill, limit_area="inside")
     )
+    df.loc[short, col] = filled[short]
     df = df[~long]
 
-    print(f"zero cleanup: filled {short.sum()} readings in short runs, "
+    print(f"zero cleanup (training rows only): filled {short.sum()} readings in short runs, "
           f"dropped {long.sum()} readings in long runs")
     return df
 
-def drop_outliers(df, col="readingvalue", group="meterid", k=10):
+def group_keys(meters, times, utility_type):
+    """
+    Keys for comparable readings, shared by outlier removal and anomaly thresholds:
+    meter + season for heat, meter + weekday + break for electricity.
+    Returned as plain arrays so they group positionally, whatever the index.
+    """
+    times = pd.Series(np.asarray(times))
+    meters = np.asarray(meters)
+    if utility_type == "heat":
+        return [meters, times.dt.month.map(SEASONS).to_numpy()]
+    return [meters, times.dt.dayofweek.to_numpy(), in_classes(times).to_numpy()]
+
+def drop_outliers(df, utility_type, col="readingvalue", k=10):
+    """
+    Drops readings more than k MADs from their group's median, in the training period only.
+    The test/replay period keeps every reading, since those outliers are the anomalies to detect,
+    and the cutoffs come from training rows only, so nothing from the test period leaks in.
+    """
     df = df[df[col] >= 0]  # negative usage is impossible (also drops NaN)
-    med = df.groupby(group)[col].transform("median")
-    mad = df.groupby(group)[col].transform(lambda s: (s - s.median()).abs().median())
-    mad = mad.replace(0, df[col].abs().median())  # flat meters
-    keep = (df[col] - med).abs() <= k * mad
-    print(f"dropping {(~keep).sum()} of {len(df)} rows as outliers")
-    return df[keep]
+    train = df[df["readingtime"] < TRAIN_END]
+
+    groups = train[col].groupby(group_keys(train["meterid"], train["readingtime"], utility_type))
+    med = groups.transform("median")
+    mad = groups.transform(lambda s: (s - s.median()).abs().median())
+    # flat groups fall back to their building's median, so pooled runs match per-building ones
+    building_med = train.groupby("sitename")[col].transform(lambda s: s.abs().median())
+    mad = mad.mask(mad == 0, building_med)
+
+    outlier = (train[col] - med).abs() > k * mad
+    print(f"dropping {outlier.sum()} of {len(train)} training rows as outliers")
+    return df.drop(index=outlier[outlier].index)
 
 def add_time_of_day(df, baseline=False):
     """
@@ -161,7 +204,7 @@ def add_usage_history(df, usage_window=24, usage_offset=24):
 
     return df.dropna(subset=[col])
 
-def preprocess_heat(df, inc_seasons=False, inc_temp_history=False, inc_usage_history=False,
+def preprocess_heat(df, inc_seasons=False, inc_months=False, inc_temp_history=False, inc_usage_history=False,
                     inc_lags=False, lag_hours=(24, 168)):
     if inc_lags:
         df = add_lag_features(df, lag_hours)
@@ -171,6 +214,8 @@ def preprocess_heat(df, inc_seasons=False, inc_temp_history=False, inc_usage_his
         df = add_usage_history(df)
     if inc_seasons:
         df["season"] = df["readingtime"].dt.month.map(SEASONS)
+    if inc_months:
+        df["month"] = df["readingtime"].dt.month
     return df
 
 
@@ -194,12 +239,14 @@ def in_classes(times):
         on_break |= dates.between(s, e)  # inclusive on both ends
     return (~on_break).astype(int)
 
-def preprocess_electricity(df, inc_lags=False, inc_weekends=False, inc_breaks=False,
+def preprocess_electricity(df, inc_lags=False, inc_weekends=False, inc_weekdays=False, inc_breaks=False,
                            lag_hours=(24, 168)):
     if inc_lags:
         df = add_lag_features(df, lag_hours)
     if inc_weekends:
         df["is_weekend"] = (df["readingtime"].dt.dayofweek >= 5).astype(int)
+    if inc_weekdays:
+        df["weekday"] = (df["readingtime"].dt.dayofweek).astype(int)
     if inc_breaks:
         df["in_classes"] = in_classes(df["readingtime"])
     return df
@@ -222,7 +269,7 @@ def preprocess(building_name, utility_type, baseline=False, **features):
 
     df = load_readings(building_name, utility_type)
     df = clean_zero_runs(df)
-    df = drop_outliers(df)
+    df = drop_outliers(df, utility_type)
 
     if utility_type == "heat":
         df = preprocess_heat(df, **features)
