@@ -10,15 +10,8 @@ import pandas as pd
 
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import HistGradientBoostingRegressor
-from sklearn.metrics import (
-    mean_absolute_error,
-    r2_score,
-    mean_squared_error
-)
 from energyiq.ml.preprocess import preprocess, group_keys, TRAIN_END  # one split date shared with outlier removal
-
-# percent of the largest test residuals dropped from trimmed_MAE
-TRIM_PCT = 2
+from energyiq.ml.evaluation import evaluate, decode_one_hot, TRIM_PCT, INJECT_SEED
 
 # best from the stage-A search; model_params passed to train() override these
 HGB_DEFAULTS = {
@@ -61,12 +54,6 @@ def parse_args():
         "-v", "--verbose",
         action="store_true",
         help="Print extra output",
-    )
-    parser.add_argument(
-        "--half-life",
-        type=float,
-        default=None,
-        help="Time-decay half-life in days (default: no weighting)",
     )
     parser.add_argument(
         "--anomaly-k",
@@ -153,45 +140,6 @@ def save_run(model, metrics, metadata, out_dir, metric="MAE"):
     else:
         print(f"Kept existing best {metric}: {best_score:.3f}")
 
-def time_decay_weights(index, half_life_days):
-    age_days = (index.max() - index) / pd.Timedelta(days=1)
-    return 0.5 ** (age_days / half_life_days)
-
-def decode_one_hot(X, prefix, fallback):
-  """Category per row from its one-hot columns, or `fallback` if they were dropped as constant."""
-  cols = [c for c in X.columns if c.startswith(prefix)]
-  if cols:
-    return X[cols].idxmax(axis=1).str.removeprefix(prefix).to_numpy()
-  return pd.Series(fallback, index=X.index).to_numpy()
-
-def print_mae_breakdowns(X_test, y_test, y_pred, building, label="all rows"):
-  """Test MAE per building and month, and per building and meter, console output only."""
-  abs_err = (y_test - y_pred).abs()
-
-  # a single building or single-meter utility has no sitename/meterid columns left
-  buildings = decode_one_hot(X_test, "sitename_", building)
-  meters = decode_one_hot(X_test, "meterid_", "only meter")
-
-  print(f"\nTest MAE by month ({label}):")
-  by_month = abs_err.groupby([abs_err.index.to_period("M"), buildings]).mean()
-  print(by_month.unstack().round(3).to_string())  # months as rows, buildings as columns
-
-  print(f"\nTest MAE by meter ({label}):")
-  print(abs_err.groupby([buildings, meters]).mean().round(3).to_string())
-
-def trim_mask(y_true, y_pred, trim_pct):
-  """
-  False for the rows with the largest trim_pct% of absolute residuals, True for the rest.
-  The share dropped is fixed, so unlike scoring only unflagged rows, a worse model can't
-  remove more of its own error.
-  """
-  abs_err = np.abs(np.asarray(y_true) - np.asarray(y_pred))
-  n_drop = int(len(abs_err) * trim_pct / 100)
-  keep = np.ones(len(abs_err), dtype=bool)
-  if n_drop:  # [-0:] would select every row
-    keep[np.argsort(abs_err)[-n_drop:]] = False
-  return keep
-
 def flag_anomalies(X_train, train_resid, X_test, test_resid, utility_type, k):
   """
   True for test rows whose |residual| is more than k x the training MAE of their group
@@ -208,11 +156,12 @@ def flag_anomalies(X_train, train_resid, X_test, test_resid, utility_type, k):
 
   return np.abs(np.asarray(test_resid)) > thresholds
 
-def train(model_type, utility_type, building, log_metrics, half_life=None,
+def train(model_type, utility_type, building, log_metrics,
           model_params=None, anomaly_k=3, trim_pct=TRIM_PCT, **features):
   
   # linear models get one-hot hours, trees get sin/cos
-  X, y = preprocess(building, utility_type, baseline=model_type != "hgb", **features)
+  X, y, labels = preprocess(building, utility_type, baseline=model_type != "hgb",
+                            inject=True, inject_seed=INJECT_SEED, **features)
 
   if log_metrics:
     print(f"{len(X)} rows, {X.shape[1]} features: {list(X.columns)}")
@@ -232,13 +181,8 @@ def train(model_type, utility_type, building, log_metrics, half_life=None,
     case _:
       raise ValueError(f"Unknown model type: {model_type}")
 
-  # optional time decay, more recent entries weighted more
-  weights = None
-  if half_life is not None:
-      weights = time_decay_weights(X_train.index, half_life)
-
   start = time.perf_counter()
-  model.fit(X_train, y_train, sample_weight=weights)
+  model.fit(X_train, y_train)
   fit_seconds = time.perf_counter() - start
   y_pred = model.predict(X_test)
   train_pred = model.predict(X_train)
@@ -248,20 +192,10 @@ def train(model_type, utility_type, building, log_metrics, half_life=None,
   print(f"flagged {anomalous.sum()} of {len(y_test)} test rows as anomalies "
         f"({anomalous.mean():.2%}, k={anomaly_k})")
 
-  kept = trim_mask(y_test, y_pred, trim_pct)
-
-  mse =mean_squared_error(y_test, y_pred)
   metrics = {
-    "MSE": mse,
-    "RMSE": mse ** 0.5,
-    "R2": r2_score(y_test, y_pred),
-    "MAE": mean_absolute_error(y_test, y_pred),
-    "trimmed_MAE": mean_absolute_error(y_test[kept], y_pred[kept]),
-    "trim_pct": trim_pct,
-    "train_MAE": mean_absolute_error(y_train, train_pred),
+    **evaluate(X_test, y_test, y_pred, anomalous, labels[~train_rows], y_train, train_pred,
+               building, trim_pct=trim_pct, verbose=log_metrics),
     "anomaly_k": anomaly_k,
-    "n_anomalies": int(anomalous.sum()),
-    "anomaly_rate": anomalous.mean(),
     "n_train": len(X_train),
     "n_test": len(X_test),
     "n_features": X.shape[1],
@@ -270,15 +204,11 @@ def train(model_type, utility_type, building, log_metrics, half_life=None,
 
   if log_metrics:
     print(metrics)
-    print_mae_breakdowns(X_test, y_test, y_pred, building)
-    print_mae_breakdowns(X_test[kept], y_test[kept], y_pred[kept], building,
-                         label=f"largest {trim_pct}% of residuals removed")
 
   return model, metrics, list(X.columns)
 
 if __name__=="__main__":
   args = parse_args()
-  # only pass the flags that were set, so a heat flag on an electricity run errors out
   all_flags = {
     "inc_seasons": args.seasons,
     "inc_temp_history": args.temp_history,
@@ -296,7 +226,6 @@ if __name__=="__main__":
     utility_type=args.utility_type,
     building=args.building,
     log_metrics=args.verbose,
-    half_life=args.half_life,
     anomaly_k=args.anomaly_k,
     trim_pct=args.trim_pct,
     **feature_kwargs,
@@ -307,8 +236,6 @@ if __name__=="__main__":
         "building": args.building,
         "utility_type": args.utility_type,
         "model_type": args.model_type,
-        "half_life": args.half_life,
-        # everything needed to rebuild the same features at prediction time
         "features": feature_kwargs,
         "feature_columns": feature_columns,
         "trained_at": datetime.now().strftime("%Y%m%d_%H%M%S"),

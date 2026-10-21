@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 from energyiq import config
+from energyiq.ml.evaluation import inject_anomalies
 
 # train: Sep 2024 - Aug 2025, test/replay: Sep 2025 - Aug 2026 (a full year each)
 TRAIN_END = "2025-09-01"
@@ -35,6 +36,10 @@ NON_FEATURE_COLS = ["id", "readingunits", "latitude", "longitude",
 # sitename is constant for a single building, so its dummy is dropped as a constant
 # column and only survives as a feature when training on All
 CATEGORICAL_COLS = ["meterid", "sitename", "hour", "season", "weekday", "month"]
+
+# known-anomaly labels for scoring the detector: the injected kind ("" if none),
+# and whether the reading broke the drop_outliers rule. Never features.
+LABEL_COLS = ["injected", "outlier"]
 
 
 # ---------------------------------------------------------------- shared steps
@@ -123,23 +128,32 @@ def group_keys(meters, times, utility_type):
 
 def drop_outliers(df, utility_type, col="readingvalue", k=10):
     """
-    Drops readings more than k MADs from their group's median, in the training period only.
-    The test/replay period keeps every reading, since those outliers are the anomalies to detect,
-    and the cutoffs come from training rows only, so nothing from the test period leaks in.
+    Readings more than k MADs from their group's median, with medians and MADs from training rows only.
+    Training outliers are dropped. Test/replay outliers are kept, since those are the anomalies to
+    detect, and marked True in an `outlier` column as known anomalies for scoring the detector.
     """
-    df = df[df[col] >= 0]  # negative usage is impossible (also drops NaN)
-    train = df[df["readingtime"] < TRAIN_END]
+    df = df[df[col] >= 0].copy()  # negative usage is impossible (also drops NaN)
+    is_train = df["readingtime"] < TRAIN_END
+    train = df[is_train]
 
     groups = train[col].groupby(group_keys(train["meterid"], train["readingtime"], utility_type))
-    med = groups.transform("median")
-    mad = groups.transform(lambda s: (s - s.median()).abs().median())
+    group_med = groups.median()
+    group_mad = groups.apply(lambda s: (s - s.median()).abs().median())
     # flat groups fall back to their building's median, so pooled runs match per-building ones
-    building_med = train.groupby("sitename")[col].transform(lambda s: s.abs().median())
-    mad = mad.mask(mad == 0, building_med)
+    building_med = train.groupby("sitename")[col].apply(lambda s: s.abs().median())
 
-    outlier = (train[col] - med).abs() > k * mad
-    print(f"dropping {outlier.sum()} of {len(train)} training rows as outliers")
-    return df.drop(index=outlier[outlier].index)
+    keys = pd.MultiIndex.from_arrays(group_keys(df["meterid"], df["readingtime"], utility_type))
+    med = group_med.reindex(keys).to_numpy()
+    mad = group_mad.reindex(keys).to_numpy()
+    mad = np.where(mad == 0, df["sitename"].map(building_med).to_numpy(), mad)
+
+    # groups never seen in training have a NaN cutoff, so they're never outliers
+    outlier = np.abs(df[col].to_numpy() - med) > k * mad
+    drop = outlier & is_train.to_numpy()
+    df["outlier"] = outlier & ~is_train.to_numpy()
+    print(f"dropping {drop.sum()} of {is_train.sum()} training rows as outliers, "
+          f"labelling {df['outlier'].sum()} of {(~is_train).sum()} test rows as outliers")
+    return df[~drop]
 
 def add_time_of_day(df, baseline=False):
     """
@@ -156,15 +170,18 @@ def add_time_of_day(df, baseline=False):
     return df
 
 def to_model_inputs(df):
-    """One-hot encode, drop non-feature columns, and split into (X, y) indexed by time."""
+    """
+    One-hot encode, drop non-feature columns, and split into (X, y, labels) indexed by time.
+    labels holds the anomaly labels (LABEL_COLS), kept out of X so they can't leak into the model.
+    """
     categorical = [c for c in CATEGORICAL_COLS if c in df.columns]
     df = pd.get_dummies(df, columns=categorical, dtype=int)
     df = df.drop(columns=NON_FEATURE_COLS, errors="ignore")
     df = df.sort_values("readingtime").set_index("readingtime")
 
-    X = df.drop(columns=["readingvalue"])
+    X = df.drop(columns=["readingvalue", *LABEL_COLS])
     X = X.loc[:, X.nunique() > 1]  # drop constant columns
-    return X, df["readingvalue"]
+    return X, df["readingvalue"], df[LABEL_COLS]
 
 
 # ---------------------------------------------------------------- heat features
@@ -254,11 +271,14 @@ def preprocess_electricity(df, inc_lags=False, inc_weekends=False, inc_weekdays=
 
 # ------------------------------------------------------------------ entry point
 
-def preprocess(building_name, utility_type, baseline=False, **features):
+def preprocess(building_name, utility_type, baseline=False, inject=False, inject_seed=0, **features):
     """
-    (X, y) for one building and utility, sorted and indexed by readingtime.
+    (X, y, labels) for one building and utility, sorted and indexed by readingtime.
+    labels has the LABEL_COLS anomaly labels for each row.
 
     baseline=True one-hot encodes the hour (linear models); otherwise sin/cos.
+    inject=True adds synthetic anomalies to the test period (see evaluation.py), before
+    the features are built so lag/history features see them too.
     Feature flags, all off by default:
       heat:        inc_seasons, inc_temp_history, inc_usage_history
       electricity: inc_lags, inc_weekends, inc_breaks
@@ -270,6 +290,10 @@ def preprocess(building_name, utility_type, baseline=False, **features):
     df = load_readings(building_name, utility_type)
     df = clean_zero_runs(df)
     df = drop_outliers(df, utility_type)
+    if inject:
+        df = inject_anomalies(df, TRAIN_END, seed=inject_seed)
+    else:
+        df["injected"] = ""
 
     if utility_type == "heat":
         df = preprocess_heat(df, **features)
@@ -281,5 +305,5 @@ def preprocess(building_name, utility_type, baseline=False, **features):
 
 
 if __name__ == "__main__":
-    X, y = preprocess("Ohio Stadium", "electricity", inc_lags=True, inc_breaks=True)
+    X, y, labels = preprocess("Ohio Stadium", "electricity", inc_lags=True, inc_breaks=True)
     print(X.shape, list(X.columns))
