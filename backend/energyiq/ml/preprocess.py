@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, text
 from energyiq import config
 from energyiq.ml.evaluation import inject_anomalies
 
-# train: Sep 2024 - Aug 2025, test/replay: Sep 2025 - Aug 2026 (a full year each)
+# train: Sep 2023 - Aug 2025, test/replay: Sep 2025 - Aug 2026 (one year)
 TRAIN_END = "2025-09-01"
 
 BREAKS = [
@@ -81,14 +81,16 @@ def load_readings(building_name, utility_type):
         raise ValueError(f"No {utility_type} readings for {building_name} building")
     return df.drop(columns=WEATHER_DROP)
 
-def clean_zero_runs(df, col="readingvalue", group="meterid", max_fill=3):
+def clean_zero_runs(df, col="readingvalue", group="meterid", max_span=pd.Timedelta(hours=1)):
     """
     Zeros that come from meter dropouts, not real usage:
-    - runs of <= max_fill consecutive zeros are interpolated from the neighbouring readings
+    - runs of zeros spanning less than max_span (first to last zero) are interpolated
+      from the neighbouring readings
     - longer runs (outages) are dropped
+    Measured in time rather than readings, since the raw data mixes hourly and 15-minute
+    readings: a lone hourly zero or up to four 15-minute zeros count as short.
     Training period only: in the test/replay period a run of zeros may be a real anomaly,
     so those readings are left as they are.
-    Assumes one reading per meter per 15-minute interval.
     """
     df = df.sort_values([group, "readingtime"]).reset_index(drop=True)
     is_train = df["readingtime"] < TRAIN_END
@@ -96,16 +98,17 @@ def clean_zero_runs(df, col="readingvalue", group="meterid", max_fill=3):
     is_zero = df[col].eq(0) & is_train
     prev_zero = is_zero.groupby(df[group]).shift(fill_value=False)
     run_id = (is_zero != prev_zero).cumsum()
-    run_len = is_zero.groupby([df[group], run_id]).transform("size")
+    run_times = df["readingtime"].groupby([df[group], run_id])
+    run_span = run_times.transform("max") - run_times.transform("min")
 
-    short = is_zero & (run_len <= max_fill)
-    long = is_zero & (run_len > max_fill)
+    short = is_zero & (run_span < max_span)
+    long = is_zero & (run_span >= max_span)
 
     # interpolate within the training period only, and only write back the short-run zeros,
     # so test readings are never filled or used to fill
     df.loc[short, col] = np.nan
     filled = df.groupby([df[group], is_train])[col].transform(
-        lambda s: s.interpolate(limit=max_fill, limit_area="inside")
+        lambda s: s.interpolate(limit_area="inside")
     )
     df.loc[short, col] = filled[short]
     df = df[~long]
@@ -154,6 +157,27 @@ def drop_outliers(df, utility_type, col="readingvalue", k=10):
     print(f"dropping {drop.sum()} of {is_train.sum()} training rows as outliers, "
           f"labelling {df['outlier'].sum()} of {(~is_train).sum()} test rows as outliers")
     return df[~drop]
+
+def hourly_means(df, col="readingvalue"):
+    """Each meter's mean reading per clock hour, indexed by (meterid, readingtime floored to the hour)."""
+    return df.groupby(["meterid", df["readingtime"].dt.floor("h")])[col].mean()
+
+def average_training_hours(df, col="readingvalue"):
+    """
+    Training readings averaged to one row per meter per clock hour, so the hourly and 15-minute
+    stretches of the raw data count alike. Test rows stay raw, since every reading is scored
+    on its own; both are on the same scale.
+    Run after the features are built: every feature is the same for all readings in an hour
+    (weather is hourly, lags/usage history come from hourly means), so only the target is averaged.
+    """
+    is_train = df["readingtime"] < TRAIN_END
+    train = df[is_train].copy()
+    hour = train["readingtime"].dt.floor("h")
+    train[col] = train.groupby([train["meterid"], hour])[col].transform("mean")
+    train["readingtime"] = hour
+    train = train.drop_duplicates(subset=["meterid", "readingtime"])
+    print(f"averaged {is_train.sum()} training readings to {len(train)} meter-hours")
+    return pd.concat([train, df[~is_train]], ignore_index=True)
 
 def add_time_of_day(df, baseline=False):
     """
@@ -205,21 +229,23 @@ def add_temp_history(df, temp_col="temperature_2m", temp_windows=(6, 24, 72)):
 def add_usage_history(df, usage_window=24, usage_offset=24):
     """
     usage_mean_{w}h: the meter's mean usage over a w-hour window ending `usage_offset`
-    hours before each reading (no lookahead). Rows without enough history are dropped.
+    hours before each reading's hour (no lookahead). Built from hourly means, so hourly and
+    15-minute data get the same feature. Rows with under half the window's hours of history
+    are dropped.
     """
-    df = df.sort_values(["meterid", "readingtime"]).reset_index(drop=True)
-
     col = f"usage_mean_{usage_window}h"
-    roll = (df.set_index("readingtime")
+    roll = (hourly_means(df).reset_index()
+              .set_index("readingtime")
               .groupby("meterid")["readingvalue"]
-              .rolling(f"{usage_window}h", min_periods=usage_window * 2)  # >= half the 15-min readings
+              .rolling(f"{usage_window}h", min_periods=usage_window // 2)
               .mean()
               .rename(col)
               .reset_index())
     roll["readingtime"] += pd.Timedelta(hours=usage_offset)
-    df = df.merge(roll, on=["meterid", "readingtime"], how="left")
 
-    return df.dropna(subset=[col])
+    df["_hour"] = df["readingtime"].dt.floor("h")
+    df = df.merge(roll.rename(columns={"readingtime": "_hour"}), on=["meterid", "_hour"], how="left")
+    return df.drop(columns="_hour").dropna(subset=[col])
 
 def preprocess_heat(df, inc_seasons=False, inc_months=False, inc_temp_history=False, inc_usage_history=False,
                     inc_lags=False, lag_hours=(24, 168)):
@@ -239,13 +265,17 @@ def preprocess_heat(df, inc_seasons=False, inc_months=False, inc_temp_history=Fa
 # --------------------------------------------------------- electricity features
 
 def add_lag_features(df, lag_hours=(24, 168)):
-    """Value of the same meter exactly `h` hours earlier; robust to gaps."""
-    base = df[["meterid", "readingtime", "readingvalue"]]
+    """
+    The same meter's mean reading over the clock hour `h` hours earlier; robust to gaps.
+    Hourly means, so 15-minute and hourly readings get equally smooth lags.
+    """
+    base = hourly_means(df).reset_index().rename(columns={"readingtime": "_hour"})
+    df["_hour"] = df["readingtime"].dt.floor("h")
     for h in lag_hours:
-        lagged = (base.assign(readingtime=base["readingtime"] + pd.Timedelta(hours=h))
+        lagged = (base.assign(_hour=base["_hour"] + pd.Timedelta(hours=h))
                       .rename(columns={"readingvalue": f"lag_{h}h"}))
-        df = df.merge(lagged, on=["meterid", "readingtime"], how="left")
-    return df.dropna(subset=[f"lag_{h}h" for h in lag_hours])
+        df = df.merge(lagged, on=["meterid", "_hour"], how="left")
+    return df.drop(columns="_hour").dropna(subset=[f"lag_{h}h" for h in lag_hours])
 
 def in_classes(times):
     dates = times.dt.normalize()
@@ -300,6 +330,7 @@ def preprocess(building_name, utility_type, baseline=False, inject=False, inject
     else:
         df = preprocess_electricity(df, **features)
 
+    df = average_training_hours(df)
     df = add_time_of_day(df, baseline)
     return to_model_inputs(df)
 

@@ -11,7 +11,11 @@ from energyiq.models import Base, Building, MeterReading, Weather
 
 logger = logging.getLogger(__name__)
 
+# Sep 2023 - Feb 2025 is mostly hourly readings (Scott House switches to 15-minute from Sep 2024),
+# Mar 2025 on is 15-minute. Both are on the same scale.
 TIME_SEGMENTS = [
+    "sep2023-feb2024",
+    "mar2024-aug2024",
     "sept2024-feb2025",
     "march2025-aug2025",
     "sept2025-feb2026",
