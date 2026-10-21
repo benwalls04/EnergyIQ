@@ -17,7 +17,9 @@ from sklearn.metrics import (
 )
 from energyiq.ml.preprocess import preprocess, group_keys, TRAIN_END  # one split date shared with outlier removal
 
-# a test residual is an anomaly when it's more than this many times its group's training MAE
+# percent of the largest test residuals dropped from trimmed_MAE
+TRIM_PCT = 2
+
 # best from the stage-A search; model_params passed to train() override these
 HGB_DEFAULTS = {
     "random_state": 42,
@@ -71,6 +73,12 @@ def parse_args():
         type=float,
         default=3,
         help=f"Flag test residuals above k x their group's training MAE (default: {3})",
+    )
+    parser.add_argument(
+        "--trim-pct",
+        type=float,
+        default=TRIM_PCT,
+        help=f"Percent of the largest test residuals dropped from trimmed_MAE (default: {TRIM_PCT})",
     )
 
     # feature flags passed through to preprocess
@@ -171,6 +179,19 @@ def print_mae_breakdowns(X_test, y_test, y_pred, building, label="all rows"):
   print(f"\nTest MAE by meter ({label}):")
   print(abs_err.groupby([buildings, meters]).mean().round(3).to_string())
 
+def trim_mask(y_true, y_pred, trim_pct):
+  """
+  False for the rows with the largest trim_pct% of absolute residuals, True for the rest.
+  The share dropped is fixed, so unlike scoring only unflagged rows, a worse model can't
+  remove more of its own error.
+  """
+  abs_err = np.abs(np.asarray(y_true) - np.asarray(y_pred))
+  n_drop = int(len(abs_err) * trim_pct / 100)
+  keep = np.ones(len(abs_err), dtype=bool)
+  if n_drop:  # [-0:] would select every row
+    keep[np.argsort(abs_err)[-n_drop:]] = False
+  return keep
+
 def flag_anomalies(X_train, train_resid, X_test, test_resid, utility_type, k):
   """
   True for test rows whose |residual| is more than k x the training MAE of their group
@@ -188,7 +209,7 @@ def flag_anomalies(X_train, train_resid, X_test, test_resid, utility_type, k):
   return np.abs(np.asarray(test_resid)) > thresholds
 
 def train(model_type, utility_type, building, log_metrics, half_life=None,
-          model_params=None, anomaly_k=3, **features):
+          model_params=None, anomaly_k=3, trim_pct=TRIM_PCT, **features):
   
   # linear models get one-hot hours, trees get sin/cos
   X, y = preprocess(building, utility_type, baseline=model_type != "hgb", **features)
@@ -222,27 +243,25 @@ def train(model_type, utility_type, building, log_metrics, half_life=None,
   y_pred = model.predict(X_test)
   train_pred = model.predict(X_train)
 
-  # accuracy on the test rows that weren't flagged as anomalies
   anomalous = flag_anomalies(X_train, y_train - train_pred, X_test, y_test - y_pred,
                              utility_type, anomaly_k)
-  normal = ~anomalous
   print(f"flagged {anomalous.sum()} of {len(y_test)} test rows as anomalies "
         f"({anomalous.mean():.2%}, k={anomaly_k})")
 
+  kept = trim_mask(y_test, y_pred, trim_pct)
+
   mse =mean_squared_error(y_test, y_pred)
-  normal_mse = mean_squared_error(y_test[normal], y_pred[normal])
   metrics = {
     "MSE": mse,
     "RMSE": mse ** 0.5,
     "R2": r2_score(y_test, y_pred),
     "MAE": mean_absolute_error(y_test, y_pred),
+    "trimmed_MAE": mean_absolute_error(y_test[kept], y_pred[kept]),
+    "trim_pct": trim_pct,
     "train_MAE": mean_absolute_error(y_train, train_pred),
     "anomaly_k": anomaly_k,
     "n_anomalies": int(anomalous.sum()),
     "anomaly_rate": anomalous.mean(),
-    "normal_MAE": mean_absolute_error(y_test[normal], y_pred[normal]),
-    "normal_RMSE": normal_mse ** 0.5,
-    "normal_R2": r2_score(y_test[normal], y_pred[normal]),
     "n_train": len(X_train),
     "n_test": len(X_test),
     "n_features": X.shape[1],
@@ -252,8 +271,8 @@ def train(model_type, utility_type, building, log_metrics, half_life=None,
   if log_metrics:
     print(metrics)
     print_mae_breakdowns(X_test, y_test, y_pred, building)
-    print_mae_breakdowns(X_test[normal], y_test[normal], y_pred[normal], building,
-                         label=f"anomalies removed, k={anomaly_k}")
+    print_mae_breakdowns(X_test[kept], y_test[kept], y_pred[kept], building,
+                         label=f"largest {trim_pct}% of residuals removed")
 
   return model, metrics, list(X.columns)
 
@@ -279,6 +298,7 @@ if __name__=="__main__":
     log_metrics=args.verbose,
     half_life=args.half_life,
     anomaly_k=args.anomaly_k,
+    trim_pct=args.trim_pct,
     **feature_kwargs,
   )
 
