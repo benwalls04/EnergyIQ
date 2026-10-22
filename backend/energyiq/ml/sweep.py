@@ -1,11 +1,11 @@
 """Grid searches, every config logged as its own W&B run.
 Stage 0: feature sets per (utility, model) at default hyperparameters.
-Stage A: HGB hyperparameters on the stage-0 feature picks."""
+Stage A: HGB hyperparameters on the default features (DEFAULT_FEATURES)."""
 import argparse
 import wandb
 from itertools import product
 
-from energyiq.config import EXPERIMENT_TRAIN_END, ANOMALY_K
+from energyiq.config import EXPERIMENT_TRAIN_END, ANOMALY_K, UTILITIES, default_features
 from energyiq.ml.train import train
 from energyiq.ml.evaluation import TRIM_PCT
 
@@ -15,23 +15,6 @@ MODELS = ["regression", "hgb"]
 FEATURE_FLAGS = {
     "heat": ["inc_seasons", "inc_temp_history", "inc_usage_history"],
     "electricity": ["inc_lags", "inc_weekends", "inc_breaks", "inc_events"],
-}
-
-# features used in stage A, per building and utility
-HEAT_FEATURES = {"inc_seasons": True, "inc_temp_history": True, "inc_usage_history": True}
-BEST_FEATURES = {
-    "Ohio Stadium": {
-        "heat": HEAT_FEATURES,
-        "electricity": {"inc_lags": True, "inc_weekends": True},
-    },
-    "Thompson Memorial Library": {
-        "heat": HEAT_FEATURES,
-        "electricity": {"inc_lags": True, "inc_weekends": True, "inc_breaks": True},
-    },
-    "Scott House": {
-        "heat": HEAT_FEATURES,
-        "electricity": {"inc_lags": True, "inc_weekends": True, "inc_breaks": True},
-    },
 }
 
 HGB_GRID = {
@@ -65,7 +48,7 @@ def plan_stage0(building):
 
 def plan_stageA(building):
     runs = []
-    for utility, features in BEST_FEATURES[building].items():
+    for utility in UTILITIES:
         for values in product(*HGB_GRID.values()):
             params = dict(zip(HGB_GRID, values))
             # HGB's built-in early stopping holds out a shuffled 10%, so turn it off
@@ -75,23 +58,9 @@ def plan_stageA(building):
                         f"-leaves{params['max_leaf_nodes']}-msl{params['min_samples_leaf']}",
                 "model_type": "hgb",
                 "utility_type": utility,
-                "features": features,
+                "features": default_features(utility),
                 "model_params": params,
             })
-    return runs
-
-HEAT_FLAGS_H = ["inc_seasons", "inc_temp_history", "inc_usage_history", "inc_lags"]
-
-def plan_stageH(building):
-    runs = []
-    for values in product([False, True], repeat=len(HEAT_FLAGS_H)):
-        features = dict(zip(HEAT_FLAGS_H, values))
-        runs.append({
-            "name": f"hgb-heat-{features_name(features)}",
-            "model_type": "hgb",
-            "utility_type": "heat",
-            "features": features,
-        })
     return runs
 
 
@@ -129,7 +98,7 @@ def log_to_wandb(args, run, model, metrics):
 def parse_args():
     parser = argparse.ArgumentParser(description="Grid search, logged to W&B")
     parser.add_argument("building", help="Building to sweep")
-    parser.add_argument("--stage", choices=["0", "A","H"], default="0",
+    parser.add_argument("--stage", choices=["0", "A"], default="0",
                         help="0: feature sets, A: HGB hyperparameters (default: 0)")
     parser.add_argument("--project", default="energyiq", help="W&B project")
     parser.add_argument("--limit", type=int, default=None,
@@ -139,7 +108,7 @@ def parse_args():
     return parser.parse_args()
 
 
-PLANS = {"0": plan_stage0, "A": plan_stageA, "H": plan_stageH}
+PLANS = {"0": plan_stage0, "A": plan_stageA}
 def main():
     args = parse_args()
     runs = PLANS[args.stage](args.building)

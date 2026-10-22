@@ -40,7 +40,6 @@ def _in_range(df: pd.DataFrame, col: str, start: str | None, end: str | None) ->
 
 
 def load_meter_readings_df(data_dir: pathlib.Path, start: str | None = None, end: str | None = None) -> pd.DataFrame:
-    """Load meter readings in [start, end) from the time-segment folders under `data_dir` (all of them by default)."""
     # ISO dates compare correctly as strings, so only overlapping folders are read
     paths = [p for folder, seg_start, seg_end in TIME_SEGMENTS
              if (end is None or seg_start < end) and (start is None or seg_end > start)
@@ -55,7 +54,6 @@ def load_meter_readings_df(data_dir: pathlib.Path, start: str | None = None, end
 
 
 def load_weather_df(data_dir: pathlib.Path, start: str | None = None, end: str | None = None) -> pd.DataFrame:
-    """Load hourly weather observations in [start, end) from `data_dir / weather_data` (all of them by default)."""
     # weather files are yearly, not per segment, so read them all and filter on date
     paths = sorted((data_dir / WEATHER_DIR).glob("*.csv"))
     df = _read_csvs(paths, "weather")
@@ -67,7 +65,6 @@ def load_weather_df(data_dir: pathlib.Path, start: str | None = None, end: str |
 
 
 def build_database(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: pd.DataFrame) -> dict[str, int]:
-    """Drop and recreate all tables at `db_path`, load the data, and return row counts per table."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(f"duckdb:///{db_path}")
     try:
@@ -79,7 +76,6 @@ def build_database(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: p
 
 
 def insert_readings(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: pd.DataFrame) -> dict[str, int]:
-    """Append meter readings and weather to the existing tables, adding any new buildings; return row counts per table."""
     engine = create_engine(f"duckdb:///{db_path}")
 
     try:
@@ -123,7 +119,6 @@ def insert_readings(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: 
 
 
 def insert_anomalies(db_path: pathlib.Path, anomaly_df: pd.DataFrame) -> None:
-    """Append detected anomalies, looking up each one's building from its meter."""
     engine = create_engine(f"duckdb:///{db_path}")
 
     try:

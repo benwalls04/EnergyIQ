@@ -90,14 +90,6 @@ def inject_anomalies(df, start, seed=INJECT_SEED, col="readingvalue"):
 
 # ------------------------------------------------------------- metrics
 
-def decode_one_hot(X, prefix, fallback):
-    """Category per row from its one-hot columns, or `fallback` if they were dropped as constant."""
-    cols = [c for c in X.columns if c.startswith(prefix)]
-    if cols:
-        return X[cols].idxmax(axis=1).str.removeprefix(prefix).to_numpy()
-    return pd.Series(fallback, index=X.index).to_numpy()
-
-
 def trim_mask(y_true, y_pred, trim_pct):
     """
     False for the rows with the largest trim_pct% of absolute residuals, True for the rest.
@@ -123,19 +115,28 @@ def accuracy_metrics(y_true, y_pred, trim_pct):
     }
 
 
-def detection_metrics(flagged, injected, outlier):
+def confusion(flagged, injected, outlier):
     """
-    Scores the flags against the known anomalies: injected rows plus test rows that broke
-    the drop_outliers rule. Real anomalies the outlier rule misses still count as false
-    positives, so precision and false_positive_rate are lower and upper bounds respectively.
+    (truth, tp, fp, fn, tn) for the flags against the known anomalies: injected rows plus
+    test rows that broke the drop_outliers rule.
     """
     truth = (injected != "") | outlier
-    tp = (flagged & truth).sum()
+    return (truth, (flagged & truth).sum(), (flagged & ~truth).sum(),
+            (~flagged & truth).sum(), (~flagged & ~truth).sum())
+
+
+def detection_metrics(flagged, injected, outlier):
+    """
+    Scores the flags against the known anomalies (see confusion). Real anomalies the outlier
+    rule misses still count as false positives, so precision and false_positive_rate are lower
+    and upper bounds respectively.
+    """
+    truth, tp, fp, fn, tn = confusion(flagged, injected, outlier)
     metrics = {
         "n_anomalies": int(flagged.sum()),
         "n_labelled": int(truth.sum()),
         "precision": float(tp / flagged.sum()) if flagged.any() else np.nan,
-        "false_positive_rate": float((flagged & ~truth).sum() / (~truth).sum()),
+        "false_positive_rate": float(fp / (fp + tn)),
         "recall_outlier": float(flagged[outlier].mean()) if outlier.any() else np.nan,
     }
     # recall per kind rather than overall, since the kinds have very different row counts
@@ -145,20 +146,18 @@ def detection_metrics(flagged, injected, outlier):
     return metrics
 
 
-def flags_per_meter_week(X_test, flagged):
+def flags_per_meter_week(meta_test, flagged):
     """Flagged readings per meter per week of test data: the alert volume a facilities contact would see."""
-    n_meters = len(set(decode_one_hot(X_test, "meterid_", "only meter")))
-    weeks = (X_test.index.max() - X_test.index.min()) / pd.Timedelta(weeks=1)
+    n_meters = meta_test["meterid"].nunique()
+    weeks = (meta_test.index.max() - meta_test.index.min()) / pd.Timedelta(weeks=1)
     return float(flagged.sum() / n_meters / weeks)
 
 
-def print_mae_breakdowns(X_test, y_test, y_pred, building, label="all rows"):
+def print_mae_breakdowns(meta, y_test, y_pred, label="all rows"):
     """Overall test MAE/RMSE/R2, then MAE per building and month, and per building and meter, console output only."""
     abs_err = (y_test - y_pred).abs()
-
-    # a single building or single-meter utility has no sitename/meterid columns left
-    buildings = decode_one_hot(X_test, "sitename_", building)
-    meters = decode_one_hot(X_test, "meterid_", "only meter")
+    buildings = meta["sitename"].to_numpy()
+    meters = meta["meterid"].to_numpy()
 
     print(f"\nTest accuracy ({label}): MAE {mean_absolute_error(y_test, y_pred):.3f}, "
           f"RMSE {mean_squared_error(y_test, y_pred) ** 0.5:.3f}, R2 {r2_score(y_test, y_pred):.3f}")
@@ -192,11 +191,9 @@ def print_mae_breakdowns(X_test, y_test, y_pred, building, label="all rows"):
     print(bias.unstack().round(2).to_string())
 
 
-def print_detection_report(X_test, flagged, injected, outlier, building):
+def print_detection_report(meta_test, flagged, injected, outlier):
     """Confusion counts, recall per kind of known anomaly, and detection per building, console output only."""
-    truth = (injected != "") | outlier
-    tp, fp = (flagged & truth).sum(), (flagged & ~truth).sum()
-    fn, tn = (~flagged & truth).sum(), (~flagged & ~truth).sum()
+    truth, tp, fp, fn, tn = confusion(flagged, injected, outlier)
 
     print("\nDetection report")
     print(f"{'':>16}{'labelled':>12}{'unlabelled':>12}")
@@ -216,7 +213,7 @@ def print_detection_report(X_test, flagged, injected, outlier, building):
     print(by_kind.round(3).to_string())
 
     rows = pd.DataFrame({
-        "building": decode_one_hot(X_test, "sitename_", building),
+        "building": meta_test["sitename"].to_numpy(),
         "flagged": flagged,
         "labelled": truth,
         "caught": flagged & truth,
@@ -233,29 +230,28 @@ def print_detection_report(X_test, flagged, injected, outlier, building):
 
 # ------------------------------------------------------------- entry point
 
-def evaluate(X_test, y_test, y_pred, flagged, test_labels, y_train, train_pred, building,
-             trim_pct=TRIM_PCT, verbose=False):
+def evaluate(y_test, y_pred, flagged, meta_test, y_train, train_pred, verbose=False):
     """
     All evaluation metrics for one run, as a dict.
     Accuracy is scored on the real test readings only, so the injected anomalies don't count
-    as model error. Detection is scored on every test row. test_labels holds the LABEL_COLS
-    from preprocess for the test rows; verbose prints the MAE breakdowns and detection report.
+    as model error. Detection is scored on every test row. meta_test holds preprocess's meta
+    for the test rows; verbose prints the MAE breakdowns and detection report.
     """
-    injected = test_labels["injected"].to_numpy()
-    outlier = test_labels["outlier"].to_numpy()
+    injected = meta_test["injected"].to_numpy()
+    outlier = meta_test["outlier"].to_numpy()
     real = injected == ""
-    X_real, y_real, pred_real = X_test[real], y_test[real], y_pred[real]
+    meta_real, y_real, pred_real = meta_test[real], y_test[real], y_pred[real]
 
     metrics = {
-        **accuracy_metrics(y_real, pred_real, trim_pct),
+        **accuracy_metrics(y_real, pred_real, TRIM_PCT),
         "train_MAE": float(mean_absolute_error(y_train, train_pred)),
         **detection_metrics(flagged, injected, outlier),
-        "flags_per_meter_week": flags_per_meter_week(X_test, flagged),
+        "flags_per_meter_week": flags_per_meter_week(meta_test, flagged),
     }
 
     if verbose:
-        kept = trim_mask(y_real, pred_real, trim_pct)
-        print_mae_breakdowns(X_real[kept], y_real[kept], pred_real[kept], building,
-                             label=f"real readings, largest {trim_pct}% of residuals removed")
-        print_detection_report(X_test, flagged, injected, outlier, building)
+        kept = trim_mask(y_real, pred_real, TRIM_PCT)
+        print_mae_breakdowns(meta_real[kept], y_real[kept], pred_real[kept],
+                             label=f"real readings, largest {TRIM_PCT}% of residuals removed")
+        print_detection_report(meta_test, flagged, injected, outlier)
     return metrics

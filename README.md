@@ -13,7 +13,8 @@ EnergyIQ/
 │   │   ├── ingest.py        # loads the raw CSVs into the database
 │   │   ├── anomaly_detector.py # flags anomalies in a batch of readings using saved replay models
 │   │   └── ml/
-│   │       ├── preprocess.py  # turns database rows (or raw CSVs) into model features
+│   │       ├── preprocess.py  # turns database rows into model features; academic breaks and stadium events live here
+│   │       ├── thresholds.py  # per-group anomaly thresholds (shared by training and the detector)
 │   │       ├── train.py       # trains and scores one model; also trains the replay models
 │   │       ├── evaluation.py  # metrics and helpers shared by train.py/sweep.py
 │   │       ├── sweep.py       # runs many training configs, logs them to W&B
@@ -84,9 +85,10 @@ The segments are listed in `TIME_SEGMENTS` in `energyiq/config.py`, one per fold
 1. **Initial state.** Wipes and recreates every table, then loads all readings and weather *before* `2025-09-01` (Sep 2023 – Aug 2025). No anomalies are detected for this period; it's the starting training data.
 2. **Initial models.** Trains one HGB model per utility (`heat`, `electricity`) on all three buildings at once, using the default features from `DEFAULT_FEATURES` and settings from `HGB_DEFAULTS` in `config.py`. Saved to `energyiq/ml/models/replay/2025-09-01/<utility>.joblib`.
 3. **For each later segment** (`sept2025-feb2026`, then `march2026-sept2026`):
-   1. **Detect.** `AnomalyDetector` loads the previous step's models and runs them over that segment's raw CSVs (not the database, which doesn't have the segment yet). Every feature only looks backwards in time.
-   2. **Insert.** Appends the segment's readings and weather to the database, then its anomalies to `anomalies`, tagged with the segment's folder name in the `segment` column.
-   3. **Retrain.** Trains fresh models on everything in the database so far, **except readings already flagged as anomalies**, and saves them under `replay/<segment end date>/` (e.g. `replay/2026-03-01/`). These are used to detect on the next segment.
+   1. **Insert readings.** Appends the segment's readings and weather to the database.
+   2. **Detect.** `AnomalyDetector` loads the previous step's models and runs them over the segment, reading it from the database along with the 8 days before it so the first week's lag features have real history. The models were trained before the segment was added, and every feature only looks backwards in time, so there's no lookahead. Where a lag is still missing (a gap in the data), it's left empty rather than guessed.
+   3. **Insert anomalies.** Appends the segment's anomalies to `anomalies`, tagged with the segment's folder name in the `segment` column.
+   4. **Retrain.** Trains fresh models on everything in the database so far, **except readings already flagged as anomalies**, and saves them under `replay/<segment end date>/` (e.g. `replay/2026-03-01/`). These are used to detect on the next segment.
 
 The models from the final retrain (`replay/2026-09-01/`) are trained on all the data and are the "current" models.
 
@@ -154,10 +156,9 @@ python -m energyiq.ml.train --building "Ohio Stadium" --utility-type electricity
 
 - `--building`: `All` (default, one model across all three buildings), `Ohio Stadium`, `Thompson Memorial Library`, or `Scott House`.
 - `--utility-type`: `electricity` (default) or `heat`. Each utility is modeled separately.
-- `--model-type`: `hgb` (gradient-boosted trees, the main model), `regression` (linear baseline, the default), or `ridge` (regularized linear).
+- `--model-type`: `hgb` (gradient-boosted trees, the main model) or `regression` (linear baseline, the default).
 - `-v`: prints the features used, overall test metrics, and test error broken down per month and per meter.
 - `--anomaly-k`: threshold multiplier for flagging test anomalies (default `ANOMALY_K` from `config.py`).
-- `--trim-pct`: percent of the largest test errors left out of MAE/RMSE/R² (default 2).
 - `--save`: saves the model to `energyiq/ml/models/experiments/<utility>/` and updates `best.joblib` / `best.json` there if its MAE beats the saved best. These experiment models aren't committed.
 
 **Feature flags.** The defaults per utility come from `DEFAULT_FEATURES` in `config.py`, so you don't need to pass anything for the standard setup. Pass a flag to turn a feature on, or its `--no-` form (e.g. `--no-lags`) to turn a default off.
@@ -181,7 +182,7 @@ Turning on a heat flag for electricity (or the reverse) gives an error.
 - **Train:** everything before `EXPERIMENT_TRAIN_END` (`2025-09-01`), i.e. Sep 2023 – Aug 2025. **Test:** Sep 2025 – Aug 2026. Split by date, never shuffled.
 - Training data is cleaned first: runs of zero readings are fixed and extreme outliers are dropped. Test data is left raw.
 - Synthetic anomalies (short spikes and dropouts) are injected into the test period with a fixed seed, so the anomaly detector can be scored against known answers. Accuracy metrics are computed on the real (non-injected) test readings.
-- The main metric is **MAE** (average error, in the meter's units) on the test period, after trimming the largest 2% of errors. Only compare MAE within the same building and utility. Detection metrics for the injected anomalies are reported too.
+- The main metric is **MAE** (average error, in the meter's units) on the test period, after trimming the largest 2% of errors (`TRIM_PCT` in `evaluation.py`). Only compare MAE within the same building and utility. Detection metrics for the injected anomalies are reported too.
 - HGB settings were picked by a grid search and live in `HGB_DEFAULTS` in `config.py`.
 - **Build the database without `--replay` before running experiments.** Training data is read from the database, and readings in the `anomalies` table are left out. After a replay build, that removes flagged readings from the test period, so the scores won't be comparable with runs on a plain build.
 

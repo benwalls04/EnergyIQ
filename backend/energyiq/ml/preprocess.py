@@ -2,19 +2,19 @@ import pandas as pd
 import numpy as np
 from sqlalchemy import create_engine, text
 from energyiq import config
-from energyiq.ingest import load_meter_readings_df, load_weather_df
 from energyiq.ml.evaluation import inject_anomalies
 
+# academic breaks, (first day, last day) inclusive
 BREAKS = [
-    ("10/12/23", "10/13/23"), ("11/22/23", "11/24/23"), ("12/15/23", "1/7/24"),
-    ("3/11/24", "3/15/24"),   ("5/1/24", "8/19/24"),
-    ("10/10/24", "10/11/24"), ("11/27/24", "11/29/24"), ("12/13/24", "1/5/25"),
-    ("3/10/25", "3/14/25"),   ("4/30/25", "8/18/25"),
-    ("10/16/25", "10/17/25"), ("11/26/25", "11/28/25"), ("12/19/25", "1/11/26"),
-    ("3/16/26", "3/20/26"),   ("5/5/26", "8/24/26"),
-    ("10/15/26", "10/16/26"), ("11/25/26", "11/27/26"),
-    ("12/18/26", "1/10/27"),  # was 11/18/26, check against the calendar
-    ("3/15/27", "3/19/27"),   ("5/5/27", "8/23/27"),
+    ("2023-10-12", "2023-10-13"), ("2023-11-22", "2023-11-24"), ("2023-12-15", "2024-01-07"),
+    ("2024-03-11", "2024-03-15"), ("2024-05-01", "2024-08-19"),
+    ("2024-10-10", "2024-10-11"), ("2024-11-27", "2024-11-29"), ("2024-12-13", "2025-01-05"),
+    ("2025-03-10", "2025-03-14"), ("2025-04-30", "2025-08-18"),
+    ("2025-10-16", "2025-10-17"), ("2025-11-26", "2025-11-28"), ("2025-12-19", "2026-01-11"),
+    ("2026-03-16", "2026-03-20"), ("2026-05-05", "2026-08-24"),
+    ("2026-10-15", "2026-10-16"), ("2026-11-25", "2026-11-27"),
+    ("2026-12-18", "2027-01-10"),  # was 11/18/26, check against the calendar
+    ("2027-03-15", "2027-03-19"), ("2027-05-05", "2027-08-23"),
 ]
 
 # Ohio Stadium events, (start, approx. end) in Eastern local time. readingtime is UTC, so these
@@ -82,6 +82,7 @@ SEASONS = {12: "winter", 1: "winter", 2: "winter",
            6: "summer", 7: "summer", 8: "summer",
            9: "fall", 10: "fall", 11: "fall"}
 
+
 WEATHER_DROP = ["direct_radiation", "diffuse_radiation", "direct_normal_irradiance",
               "wind_speed_100m", "wind_direction_100m", "wind_direction_10m",
               "relative_humidity_2m", "apparent_temperature"]
@@ -91,39 +92,44 @@ NON_FEATURE_COLS = ["id", "readingunits", "latitude", "longitude",
                     "building_id", "date", "utility"]
 
 # categorical columns that get one-hot encoded when present.
-# sitename is constant for a single building, so its dummy is dropped as a constant
-# column and only survives as a feature when training on All
 CATEGORICAL_COLS = ["meterid", "sitename", "hour", "season", "weekday", "month"]
 
 # known-anomaly labels for scoring the detector: the injected kind ("" if none),
 # and whether the reading broke the drop_outliers rule. Never features.
 LABEL_COLS = ["injected", "outlier"]
 
+# per-row info returned alongside X (labels, plus what thresholds and reports group by)
+META_COLS = ["meterid", "sitename", "event_day", *LABEL_COLS]
+
+LAG_HOURS = (24, 168)
+TEMP_WINDOWS = (6, 24, 72)
+USAGE_WINDOW = 24  
+USAGE_OFFSET = 24 
+HISTORY_LOOKBACK = pd.Timedelta(hours=max(LAG_HOURS) + 24)
+ZERO_RUN_MAX_SPAN = pd.Timedelta(hours=1)
+
+OUTLIER_K = 15
+
 
 # ---------------------------------------------------------------- shared steps
 
-def load_readings(building_name, utility_type, end=None):
-    """
-    One building's readings for one utility before `end` (all of them if None), joined to the
-    weather for that hour. Readings already flagged in the anomalies table are left out, so a
-    replay's anomalies don't feed later training.
-    """
+def load_readings(building_name, utility_type, start=None, end=None, exclude_anomalies=True):
+    conditions, params = ["m.utility = :utility"], {"utility": utility_type.upper()}
+    if exclude_anomalies:
+        conditions.append("a.id IS NULL")
+    if building_name != "All":
+        conditions.append("b.sitename = :name")
+        params["name"] = building_name
+    if start is not None:
+        conditions.append("m.readingtime >= :start")
+        params["start"] = pd.Timestamp(start)
+    if end is not None:
+        conditions.append("m.readingtime < :end")
+        params["end"] = pd.Timestamp(end)
+
     engine = create_engine(f"duckdb:///{config.DB_PATH}")
     try:
         with engine.connect() as conn:
-            conditions, params = ["a.id IS NULL"], {}
-            if building_name != "All":
-                row = conn.execute(
-                    text("SELECT id FROM buildings WHERE sitename = :name"),
-                    {"name": building_name},
-                ).first()
-                if row is None:
-                    raise ValueError(f"No building named {building_name!r}")
-                conditions.append("m.building_id = :bId")
-                params["bId"] = row[0]
-            if end is not None:
-                conditions.append("m.readingtime < :end")
-                params["end"] = pd.Timestamp(end)
             df = pd.read_sql(text(f"""
                 SELECT m.*, b.sitename, w.*
                 FROM meter_readings m
@@ -137,38 +143,14 @@ def load_readings(building_name, utility_type, end=None):
     finally:
         engine.dispose()
 
-    df = df[df["utility"] == utility_type.upper()]
     if df.empty:
-        raise ValueError(f"No {utility_type} readings for {building_name} building")
+        raise ValueError(f"No {utility_type} readings for building {building_name!r}")
     return df.drop(columns=WEATHER_DROP)
 
-def load_readings_from_csv(building_name, utility_type, start, end):
-    """
-    Like load_readings, but for [start, end) straight from the raw CSVs instead of the DB:
-    a replay batch that hasn't been loaded into the DB yet.
-    """
-    energy = load_meter_readings_df(config.DATA_DIR, start, end)
-    weather = load_weather_df(config.DATA_DIR, start, end)
-
-    energy = energy[energy["utility"] == utility_type.upper()]
-    if building_name != "All":
-        energy = energy[energy["sitename"] == building_name]
-
-    # match the DB join's columns: drop the CSV-only ones (month would become a feature),
-    # then join the weather for that hour
-    energy = energy.drop(columns=["simscode", "year", "month", "day"])
-    energy["_hour"] = energy["readingtime"].dt.floor("h")
-    weather["_hour"] = weather["date"].dt.floor("h")
-    df = energy.merge(weather, on="_hour").drop(columns="_hour")
-
-    if df.empty:
-        raise ValueError(f"No {utility_type} readings for {building_name} building in [{start}, {end})")
-    return df.drop(columns=WEATHER_DROP)
-
-def clean_zero_runs(df, train_end, col="readingvalue", group="meterid", max_span=pd.Timedelta(hours=1)):
+def clean_zero_runs(df, train_end):
     """
     Zeros that come from meter dropouts, not real usage:
-    - runs of zeros spanning less than max_span (first to last zero) are interpolated
+    - runs of zeros spanning less than ZERO_RUN_MAX_SPAN (first to last zero) are interpolated
       from the neighbouring readings
     - longer runs (outages) are dropped
     Measured in time rather than readings, since the raw data mixes hourly and 15-minute
@@ -176,25 +158,25 @@ def clean_zero_runs(df, train_end, col="readingvalue", group="meterid", max_span
     Training period only: in the test/replay period a run of zeros may be a real anomaly,
     so those readings are left as they are.
     """
-    df = df.sort_values([group, "readingtime"]).reset_index(drop=True)
+    df = df.sort_values(["meterid", "readingtime"]).reset_index(drop=True)
     is_train = df["readingtime"] < train_end
 
-    is_zero = df[col].eq(0) & is_train
-    prev_zero = is_zero.groupby(df[group]).shift(fill_value=False)
+    is_zero = df["readingvalue"].eq(0) & is_train
+    prev_zero = is_zero.groupby(df["meterid"]).shift(fill_value=False)
     run_id = (is_zero != prev_zero).cumsum()
-    run_times = df["readingtime"].groupby([df[group], run_id])
+    run_times = df["readingtime"].groupby([df["meterid"], run_id])
     run_span = run_times.transform("max") - run_times.transform("min")
 
-    short = is_zero & (run_span < max_span)
-    long = is_zero & (run_span >= max_span)
+    short = is_zero & (run_span < ZERO_RUN_MAX_SPAN)
+    long = is_zero & (run_span >= ZERO_RUN_MAX_SPAN)
 
     # interpolate within the training period only, and only write back the short-run zeros,
     # so test readings are never filled or used to fill
-    df.loc[short, col] = np.nan
-    filled = df.groupby([df[group], is_train])[col].transform(
+    df.loc[short, "readingvalue"] = np.nan
+    filled = df.groupby([df["meterid"], is_train])["readingvalue"].transform(
         lambda s: s.interpolate(limit_area="inside")
     )
-    df.loc[short, col] = filled[short]
+    df.loc[short, "readingvalue"] = filled[short]
     df = df[~long]
 
     print(f"zero cleanup (training rows only): filled {short.sum()} readings in short runs, "
@@ -221,15 +203,14 @@ def group_keys(meters, times, utility_type, event_day=None):
         classes = np.where(event, -1, classes)
     return [meters, weekday, classes]
 
-def drop_outliers(df, utility_type, train_end, col="readingvalue", k=15, by_events=False):
+def drop_outliers(df, utility_type, train_end, by_events=False):
     """
-    Readings more than k MADs from their group's median, with medians and MADs from training rows only.
-    Training outliers are dropped. Test/replay outliers are kept, since those are the anomalies to
-    detect, and marked True in an `outlier` column as known anomalies for scoring the detector.
-    k=15 rather than 10: the stadium's flat baseline makes its MADs tiny, and 70% of what k=10 dropped
-    sat between 10 and 15 MADs (an ordinary operating mode, not glitches); drops fall off by k=20.
+    Readings more than OUTLIER_K MADs from their group's median, with medians and MADs from
+    training rows only. Training outliers are dropped. Test/replay outliers are kept, since those
+    are the anomalies to detect, and marked True in an `outlier` column as known anomalies for
+    scoring the detector.
     """
-    df = df[df[col] >= 0].copy()  # negative usage is impossible (also drops NaN)
+    df = df[df["readingvalue"] >= 0].copy()  # negative usage is impossible (also drops NaN)
     is_train = df["readingtime"] < train_end
     # by_events: stadium event days get their own groups, as the thresholds do (see group_keys).
     # Features aren't built yet, so they're found here
@@ -237,12 +218,12 @@ def drop_outliers(df, utility_type, train_end, col="readingvalue", k=15, by_even
                  if by_events else np.zeros(len(df), dtype=int))
     train = df[is_train]
 
-    groups = train[col].groupby(group_keys(train["meterid"], train["readingtime"], utility_type,
-                                           event_day[is_train.to_numpy()]))
+    groups = train["readingvalue"].groupby(group_keys(train["meterid"], train["readingtime"], utility_type,
+                                                      event_day[is_train.to_numpy()]))
     group_med = groups.median()
     group_mad = groups.apply(lambda s: (s - s.median()).abs().median())
     # flat groups fall back to their building's median, so pooled runs match per-building ones
-    building_med = train.groupby("sitename")[col].apply(lambda s: s.abs().median())
+    building_med = train.groupby("sitename")["readingvalue"].apply(lambda s: s.abs().median())
 
     keys = pd.MultiIndex.from_arrays(group_keys(df["meterid"], df["readingtime"], utility_type, event_day))
     med = group_med.reindex(keys).to_numpy()
@@ -250,18 +231,17 @@ def drop_outliers(df, utility_type, train_end, col="readingvalue", k=15, by_even
     mad = np.where(mad == 0, df["sitename"].map(building_med).to_numpy(), mad)
 
     # groups never seen in training have a NaN cutoff, so they're never outliers
-    outlier = np.abs(df[col].to_numpy() - med) > k * mad
+    outlier = np.abs(df["readingvalue"].to_numpy() - med) > OUTLIER_K * mad
     drop = outlier & is_train.to_numpy()
     df["outlier"] = outlier & ~is_train.to_numpy()
     print(f"dropping {drop.sum()} of {is_train.sum()} training rows as outliers, "
           f"labelling {df['outlier'].sum()} of {(~is_train).sum()} test rows as outliers")
     return df[~drop]
 
-def hourly_means(df, col="readingvalue"):
-    """Each meter's mean reading per clock hour, indexed by (meterid, readingtime floored to the hour)."""
-    return df.groupby(["meterid", df["readingtime"].dt.floor("h")])[col].mean()
+def hourly_means(df):
+    return df.groupby(["meterid", df["readingtime"].dt.floor("h")])["readingvalue"].mean()
 
-def average_training_hours(df, train_end, col="readingvalue"):
+def average_training_hours(df, train_end):
     """
     Training readings averaged to one row per meter per clock hour, so the hourly and 15-minute
     stretches of the raw data count alike. Test rows stay raw, since every reading is scored
@@ -272,7 +252,7 @@ def average_training_hours(df, train_end, col="readingvalue"):
     is_train = df["readingtime"] < train_end
     train = df[is_train].copy()
     hour = train["readingtime"].dt.floor("h")
-    train[col] = train.groupby([train["meterid"], hour])[col].transform("mean")
+    train["readingvalue"] = train.groupby([train["meterid"], hour])["readingvalue"].transform("mean")
     train["readingtime"] = hour
     train = train.drop_duplicates(subset=["meterid", "readingtime"])
     print(f"averaged {is_train.sum()} training readings to {len(train)} meter-hours")
@@ -289,24 +269,27 @@ def add_time_of_day(df, baseline=False):
 
 def to_model_inputs(df):
     """
-    One-hot encode, drop non-feature columns, and split into (X, y, labels) indexed by time.
-    labels holds the anomaly labels (LABEL_COLS), kept out of X so they can't leak into the model.
+    One-hot encode, drop non-feature columns, and split into (X, y, meta) indexed by time.
+    meta holds the META_COLS that are present: the anomaly labels (LABEL_COLS), kept out of X so
+    they can't leak into the model, and each row's meter, building and event day as plain values.
     """
+    df = df.sort_values("readingtime").set_index("readingtime")
+    meta = df[[c for c in META_COLS if c in df.columns]].copy()
+
     categorical = [c for c in CATEGORICAL_COLS if c in df.columns]
     df = pd.get_dummies(df, columns=categorical, dtype=int)
     df = df.drop(columns=NON_FEATURE_COLS, errors="ignore")
-    df = df.sort_values("readingtime").set_index("readingtime")
 
     X = df.drop(columns=["readingvalue", *LABEL_COLS])
     X = X.loc[:, X.nunique() > 1]  # drop constant columns
-    return X, df["readingvalue"], df[LABEL_COLS]
+    return X, df["readingvalue"], meta
 
 
 # ---------------------------------------------------------------- heat features
 
-def add_temp_history(df, temp_col="temperature_2m", temp_windows=(6, 24, 72)):
+def add_temp_history(df, temp_col="temperature_2m"):
     """
-    - temp_mean_{h}h: mean temperature over the last h hours, for each h in temp_windows
+    - temp_mean_{h}h: mean temperature over the last h hours, for each h in TEMP_WINDOWS
     - temp_min_24h:   minimum temperature over the last 24 hours
     """
     # one temperature per hour, then time-based rolling windows
@@ -314,45 +297,42 @@ def add_temp_history(df, temp_col="temperature_2m", temp_windows=(6, 24, 72)):
     temp = df.groupby("_hour")[temp_col].first().sort_index()
 
     temp_feats = pd.DataFrame(index=temp.index)
-    for h in temp_windows:
+    for h in TEMP_WINDOWS:
         temp_feats[f"temp_mean_{h}h"] = temp.rolling(f"{h}h").mean()
     temp_feats["temp_min_24h"] = temp.rolling("24h").min()
 
     return df.join(temp_feats, on="_hour").drop(columns="_hour")
 
-def add_usage_history(df, usage_window=24, usage_offset=24, fill_missing=False):
+def add_usage_history(df, drop_missing=True):
     """
-    usage_mean_{w}h: the meter's mean usage over a w-hour window ending `usage_offset`
+    usage_mean_{w}h: the meter's mean usage over a USAGE_WINDOW-hour window ending USAGE_OFFSET
     hours before each reading's hour (no lookahead). Built from hourly means, so hourly and
     15-minute data get the same feature. Rows with under half the window's hours of history
-    are dropped, or with fill_missing take the reading's own value instead.
+    are dropped, or with drop_missing=False left NaN (HGB handles missing values).
     """
-    col = f"usage_mean_{usage_window}h"
+    col = f"usage_mean_{USAGE_WINDOW}h"
     roll = (hourly_means(df).reset_index()
               .set_index("readingtime")
               .groupby("meterid")["readingvalue"]
-              .rolling(f"{usage_window}h", min_periods=usage_window // 2)
+              .rolling(f"{USAGE_WINDOW}h", min_periods=USAGE_WINDOW // 2)
               .mean()
               .rename(col)
               .reset_index())
-    roll["readingtime"] += pd.Timedelta(hours=usage_offset)
+    roll["readingtime"] += pd.Timedelta(hours=USAGE_OFFSET)
 
     df["_hour"] = df["readingtime"].dt.floor("h")
     df = df.merge(roll.rename(columns={"readingtime": "_hour"}), on=["meterid", "_hour"], how="left")
     df = df.drop(columns="_hour")
-    if fill_missing:
-        df[col] = df[col].fillna(df["readingvalue"])
-        return df
-    return df.dropna(subset=[col])
+    return df.dropna(subset=[col]) if drop_missing else df
 
 def preprocess_heat(df, inc_seasons=False, inc_months=False, inc_temp_history=False, inc_usage_history=False,
-                    inc_lags=False, lag_hours=(24, 168), fill_missing=False):
+                    inc_lags=False, drop_missing=True):
     if inc_lags:
-        df = add_lag_features(df, lag_hours, fill_missing)
+        df = add_lag_features(df, drop_missing)
     if inc_temp_history:
         df = add_temp_history(df)
     if inc_usage_history:
-        df = add_usage_history(df, fill_missing=fill_missing)
+        df = add_usage_history(df, drop_missing)
     if inc_seasons:
         df["season"] = df["readingtime"].dt.month.map(SEASONS)
     if inc_months:
@@ -362,36 +342,31 @@ def preprocess_heat(df, inc_seasons=False, inc_months=False, inc_temp_history=Fa
 
 # --------------------------------------------------------- electricity features
 
-def add_lag_features(df, lag_hours=(24, 168), fill_missing=False):
+def add_lag_features(df, drop_missing=True):
     """
-    The same meter's mean reading over the clock hour `h` hours earlier; robust to gaps.
-    Hourly means, so 15-minute and hourly readings get equally smooth lags.
-    Rows missing a lag are dropped, or with fill_missing take the reading's own value instead.
+    The same meter's mean reading over the clock hour `h` hours earlier, for each h in LAG_HOURS;
+    robust to gaps. Hourly means, so 15-minute and hourly readings get equally smooth lags.
+    Rows missing a lag are dropped, or with drop_missing=False left NaN (HGB handles missing values).
     """
     base = hourly_means(df).reset_index().rename(columns={"readingtime": "_hour"})
     df["_hour"] = df["readingtime"].dt.floor("h")
-    for h in lag_hours:
+    for h in LAG_HOURS:
         lagged = (base.assign(_hour=base["_hour"] + pd.Timedelta(hours=h))
                       .rename(columns={"readingvalue": f"lag_{h}h"}))
         df = df.merge(lagged, on=["meterid", "_hour"], how="left")
     df = df.drop(columns="_hour")
-    lag_cols = [f"lag_{h}h" for h in lag_hours]
-    if fill_missing:
-        df[lag_cols] = df[lag_cols].apply(lambda s: s.fillna(df["readingvalue"]))
-        return df
-    return df.dropna(subset=lag_cols)
+    lag_cols = [f"lag_{h}h" for h in LAG_HOURS]
+    return df.dropna(subset=lag_cols) if drop_missing else df
 
 def in_classes(times):
+    """1 for readings on a class day, 0 during an academic break."""
     dates = times.dt.normalize()
     on_break = pd.Series(False, index=times.index)
     for start, end in BREAKS:
-        s = pd.to_datetime(start, format="%m/%d/%y")
-        e = pd.to_datetime(end, format="%m/%d/%y")
-        on_break |= dates.between(s, e)  # inclusive on both ends
+        on_break |= dates.between(pd.Timestamp(start), pd.Timestamp(end))  # inclusive on both ends
     return (~on_break).astype(int)
 
 def _eastern_to_utc(times):
-    """Naive Eastern local times -> naive UTC, matching readingtime (handles EDT/EST)."""
     return times.dt.tz_localize("America/New_York").dt.tz_convert("UTC").dt.tz_localize(None)
 
 def stadium_events(times, sitenames):
@@ -414,9 +389,9 @@ def stadium_events(times, sitenames):
     return (event_day & is_stadium).astype(int), (at_event & is_stadium).astype(int)
 
 def preprocess_electricity(df, inc_lags=False, inc_weekends=False, inc_weekdays=False, inc_breaks=False,
-                           inc_events=False, lag_hours=(24, 168), fill_missing=False):
+                           inc_events=False, drop_missing=True):
     if inc_lags:
-        df = add_lag_features(df, lag_hours, fill_missing)
+        df = add_lag_features(df, drop_missing)
     if inc_weekends:
         df["is_weekend"] = (df["readingtime"].dt.dayofweek >= 5).astype(int)
     if inc_weekdays:
@@ -430,49 +405,34 @@ def preprocess_electricity(df, inc_lags=False, inc_weekends=False, inc_weekdays=
 
 # ------------------------------------------------------------------ entry point
 
-def preprocess(building_name, utility_type, baseline=False, inject=False, inject_seed=0, inference=False,
+def preprocess(building_name, utility_type, baseline=False, inject=False, inference=False,
                train_end=config.EXPERIMENT_TRAIN_END, data_end=None, **features):
-    """
-    (X, y, labels) for one building and utility, sorted and indexed by readingtime.
-    labels has the LABEL_COLS anomaly labels for each row.
-
-    Readings before train_end are training rows (zero runs cleaned, outliers dropped, averaged
-    to the hour); readings from train_end up to data_end (exclusive, everything if None) are
-    test/replay rows, left raw. train_end == data_end gives training rows only.
-    inference=True is a replay batch to detect on: [train_end, data_end) read from the raw CSVs
-    instead of the DB, every reading left raw (zero runs and outliers are what's being detected),
-    and lags/usage history with no earlier data in the batch fall back to the reading's own value
-    instead of dropping the row.
-
-    baseline=True one-hot encodes the hour (linear models); otherwise sin/cos.
-    inject=True adds synthetic anomalies to the test period (see evaluation.py), before
-    the features are built so lag/history features see them too.
-    Feature flags, all off by default:
-      heat:        inc_seasons, inc_temp_history, inc_usage_history
-      electricity: inc_lags, inc_weekends, inc_breaks, inc_events
-    """
     utility_type = utility_type.lower()
     if utility_type not in ("heat", "electricity"):
         raise ValueError(f"utility_type must be 'heat' or 'electricity', got {utility_type!r}")
 
     if inference:
-        df = load_readings_from_csv(building_name, utility_type, train_end, data_end)
+        # earlier flagged anomalies included, so they don't leave gaps in the lags
+        df = load_readings(building_name, utility_type, start=pd.Timestamp(train_end) - HISTORY_LOOKBACK,
+                           end=data_end, exclude_anomalies=False)
         df["outlier"] = False
     else:
         df = load_readings(building_name, utility_type, end=data_end)
         df = clean_zero_runs(df, train_end)
         df = drop_outliers(df, utility_type, train_end, by_events=features.get("inc_events", False))
     if inject:
-        df = inject_anomalies(df, train_end, seed=inject_seed)
+        df = inject_anomalies(df, train_end)
     else:
         df["injected"] = ""
 
     if utility_type == "heat":
-        df = preprocess_heat(df, fill_missing=inference, **features)
+        df = preprocess_heat(df, drop_missing=not inference, **features)
     else:
-        df = preprocess_electricity(df, fill_missing=inference, **features)
+        df = preprocess_electricity(df, drop_missing=not inference, **features)
 
-    if not inference:
+    if inference:
+        df = df[df["readingtime"] >= train_end]  # the lookback was only there for the features
+    else:
         df = average_training_hours(df, train_end)
     df = add_time_of_day(df, baseline)
     return to_model_inputs(df)

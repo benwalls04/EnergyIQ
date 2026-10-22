@@ -7,6 +7,7 @@ DB_PATH = ROOT / "data" / "db" / "energyiq.duckdb"
 MODELS_DIR = Path(__file__).resolve().parent / "ml" / "models"
 EXPERIMENT_MODELS_DIR = MODELS_DIR / "experiments" 
 REPLAY_MODELS_DIR = MODELS_DIR / "replay" 
+WEATHER_DIR = "weather_data"  # under DATA_DIR
 
 UTILITIES = ["heat", "electricity"]
 
@@ -14,6 +15,10 @@ DEFAULT_FEATURES = {
     "electricity": {"inc_lags", "inc_breaks", "inc_weekdays", "inc_events"},
     "heat": {"inc_lags", "inc_temp_history", "inc_usage_history", "inc_seasons"},
 }
+
+def default_features(utility_type):
+    """DEFAULT_FEATURES[utility_type] as preprocess keyword arguments."""
+    return {name: True for name in DEFAULT_FEATURES[utility_type]}
 
 HGB_DEFAULTS = {
     "random_state": 42,
@@ -38,4 +43,3 @@ TIME_SEGMENTS = [
     ("sept2025-feb2026", "2025-09-01", "2026-03-01"),
     ("march2026-sept2026", "2026-03-01", "2026-09-01"),
 ]
-WEATHER_DIR = "weather_data"
