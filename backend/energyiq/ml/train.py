@@ -171,7 +171,7 @@ def train(model_type, utility_type, building, log_metrics,
   
   # linear models get one-hot hours, trees get sin/cos
   X, y, labels = preprocess(building, utility_type, baseline=model_type != "hgb",
-                            inject=True, inject_seed=INJECT_SEED, **features)
+                            inject=True, inject_seed=INJECT_SEED, from_csv=False, **features)
 
   if log_metrics:
     print(f"{len(X)} rows, {X.shape[1]} features: {list(X.columns)}")

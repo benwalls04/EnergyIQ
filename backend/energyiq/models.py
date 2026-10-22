@@ -74,3 +74,6 @@ class Weather(Base):
     wind_direction_10m: Mapped[float | None] = mapped_column(Double)
     cloud_cover: Mapped[float | None] = mapped_column(Double)
     apparent_temperature: Mapped[float | None] = mapped_column(Double)
+
+class Anomaly(Base):
+    __tablename__ = "anomaly"

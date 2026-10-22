@@ -81,6 +81,9 @@ def load_readings(building_name, utility_type):
         raise ValueError(f"No {utility_type} readings for {building_name} building")
     return df.drop(columns=WEATHER_DROP)
 
+def load_readings_from_csv(building_name, utility_type):
+    pass 
+
 def clean_zero_runs(df, col="readingvalue", group="meterid", max_span=pd.Timedelta(hours=1)):
     """
     Zeros that come from meter dropouts, not real usage:
@@ -180,11 +183,6 @@ def average_training_hours(df, col="readingvalue"):
     return pd.concat([train, df[~is_train]], ignore_index=True)
 
 def add_time_of_day(df, baseline=False):
-    """
-    baseline (linear models): the hour as a category, one-hot encoded later, so each
-    hour gets its own coefficient.
-    otherwise (trees): sin/cos of the hour, which trees can split into any hour range.
-    """
     hour = df["readingtime"].dt.hour
     if baseline:
         df["hour"] = hour
@@ -301,7 +299,7 @@ def preprocess_electricity(df, inc_lags=False, inc_weekends=False, inc_weekdays=
 
 # ------------------------------------------------------------------ entry point
 
-def preprocess(building_name, utility_type, baseline=False, inject=False, inject_seed=0, **features):
+def preprocess(building_name, utility_type, baseline=False, inject=False, inject_seed=0, from_csv=False, **features):
     """
     (X, y, labels) for one building and utility, sorted and indexed by readingtime.
     labels has the LABEL_COLS anomaly labels for each row.
@@ -317,7 +315,10 @@ def preprocess(building_name, utility_type, baseline=False, inject=False, inject
     if utility_type not in ("heat", "electricity"):
         raise ValueError(f"utility_type must be 'heat' or 'electricity', got {utility_type!r}")
 
-    df = load_readings(building_name, utility_type)
+    if from_csv:
+        load_readings_from_csv(building_name, utility_type)
+    else:
+        df = load_readings(building_name, utility_type)
     df = clean_zero_runs(df)
     df = drop_outliers(df, utility_type)
     if inject:
@@ -333,8 +334,3 @@ def preprocess(building_name, utility_type, baseline=False, inject=False, inject
     df = average_training_hours(df)
     df = add_time_of_day(df, baseline)
     return to_model_inputs(df)
-
-
-if __name__ == "__main__":
-    X, y, labels = preprocess("Ohio Stadium", "electricity", inc_lags=True, inc_breaks=True)
-    print(X.shape, list(X.columns))
