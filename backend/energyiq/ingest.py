@@ -7,21 +7,10 @@ import pandas as pd
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
+from energyiq.config import TIME_SEGMENTS, WEATHER_DIR
 from energyiq.models import Base, Building, MeterReading, Weather
 
 logger = logging.getLogger(__name__)
-
-# Sep 2023 - Feb 2025 is mostly hourly readings (Scott House switches to 15-minute from Sep 2024),
-# Mar 2025 on is 15-minute. Both are on the same scale.
-TIME_SEGMENTS = [
-    "sep2023-feb2024",
-    "mar2024-aug2024",
-    "sept2024-feb2025",
-    "march2025-aug2025",
-    "sept2025-feb2026",
-    "march2026-sept2026",
-]
-WEATHER_DIR = "weather_data"
 
 
 def _read_csvs(paths: list[pathlib.Path], label: str, dtype: dict[str, type] | None = None) -> pd.DataFrame:
@@ -40,23 +29,39 @@ def _drop_duplicates(df: pd.DataFrame, subset: list[str], label: str) -> pd.Data
     return deduped
 
 
-def load_meter_readings_df(data_dir: pathlib.Path) -> pd.DataFrame:
-    """Load meter readings from every time-segment folder under `data_dir`."""
-    paths = [p for segment in TIME_SEGMENTS for p in sorted((data_dir / segment).glob("*.csv"))]
+def _in_range(df: pd.DataFrame, col: str, start: str | None, end: str | None) -> pd.DataFrame:
+    """Rows with `col` in [start, end); a None bound is open."""
+    keep = pd.Series(True, index=df.index)
+    if start is not None:
+        keep &= df[col] >= start
+    if end is not None:
+        keep &= df[col] < end
+    return df[keep]
+
+
+def load_meter_readings_df(data_dir: pathlib.Path, start: str | None = None, end: str | None = None) -> pd.DataFrame:
+    """Load meter readings in [start, end) from the time-segment folders under `data_dir` (all of them by default)."""
+    # ISO dates compare correctly as strings, so only overlapping folders are read
+    paths = [p for folder, seg_start, seg_end in TIME_SEGMENTS
+             if (end is None or seg_start < end) and (start is None or seg_end > start)
+             for p in sorted((data_dir / folder).glob("*.csv"))]
     # keep simscode as a string so leading zeros survive ("082", not 82)
     df = _read_csvs(paths, "energy", dtype={"simscode": str})
 
     df["readingtime"] = pd.to_datetime(df["readingtime"])
+    df = _in_range(df, "readingtime", start, end)
     df = df.dropna(subset=["readingvalue"]).sort_values("readingtime")
     return _drop_duplicates(df, ["meterid", "readingtime"], "energy")
 
 
-def load_weather_df(data_dir: pathlib.Path) -> pd.DataFrame:
-    """Load hourly weather observations from `data_dir / weather_data`."""
+def load_weather_df(data_dir: pathlib.Path, start: str | None = None, end: str | None = None) -> pd.DataFrame:
+    """Load hourly weather observations in [start, end) from `data_dir / weather_data` (all of them by default)."""
+    # weather files are yearly, not per segment, so read them all and filter on date
     paths = sorted((data_dir / WEATHER_DIR).glob("*.csv"))
     df = _read_csvs(paths, "weather")
 
     df["date"] = pd.to_datetime(df["date"])
+    df = _in_range(df, "date", start, end)
     df = df.drop(columns=["partition_0"], errors="ignore").sort_values("date")
     return _drop_duplicates(df, ["date"], "weather")
 
@@ -65,17 +70,27 @@ def build_database(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: p
     """Drop and recreate all tables at `db_path`, load the data, and return row counts per table."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     engine = create_engine(f"duckdb:///{db_path}")
-
     try:
         Base.metadata.drop_all(engine)
         Base.metadata.create_all(engine)
+    finally:
+        engine.dispose()
+    return insert_readings(db_path, energy_df, weather_df)
 
+
+def insert_readings(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: pd.DataFrame) -> dict[str, int]:
+    """Append meter readings and weather to the existing tables, adding any new buildings; return row counts per table."""
+    engine = create_engine(f"duckdb:///{db_path}")
+
+    try:
         with Session(engine) as session:
-            # buildings: small, so go through the ORM
+            # buildings: small, so go through the ORM. Earlier batches may have added them already
+            known = set(session.scalars(select(Building.simscode)))
             buildings = energy_df[["sitename", "simscode"]].drop_duplicates()
             session.add_all(
                 Building(sitename=row.sitename, simscode=row.simscode)
                 for row in buildings.itertuples(index=False)
+                if row.simscode not in known
             )
             session.flush()
 
@@ -103,5 +118,32 @@ def build_database(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: p
                 model.__tablename__: session.scalar(select(func.count()).select_from(model))
                 for model in (Building, MeterReading, Weather)
             }
+    finally:
+        engine.dispose()
+
+
+def insert_anomalies(db_path: pathlib.Path, anomaly_df: pd.DataFrame) -> None:
+    """Append detected anomalies, looking up each one's building from its meter."""
+    engine = create_engine(f"duckdb:///{db_path}")
+
+    try:
+        with Session(engine) as session:
+            duck = session.connection().connection.driver_connection
+            duck.register("anomaly_df", anomaly_df)
+            try:
+                duck.execute("""
+                    INSERT INTO anomalies
+                        (meterid, readingtime, building_id, utility, actual, predicted,
+                         residual, threshold, severity, segment)
+                    SELECT a.meterid, a.readingtime, m.building_id, a.utility, a.actual, a.predicted,
+                           a.residual, a.threshold, a.severity, a.segment
+                    FROM anomaly_df a
+                    JOIN (SELECT DISTINCT meterid, building_id FROM meter_readings) m
+                    ON m.meterid = a.meterid
+                """)
+            finally:
+                duck.unregister("anomaly_df")
+
+            session.commit()
     finally:
         engine.dispose()

@@ -4,34 +4,15 @@ import json
 import shutil
 import time
 from datetime import datetime
-from pathlib import Path
 import numpy as np
 import pandas as pd
 
 from sklearn.linear_model import LinearRegression, Ridge
 from sklearn.ensemble import HistGradientBoostingRegressor
-from energyiq.ml.preprocess import preprocess, group_keys, TRAIN_END  # one split date shared with outlier removal
+from energyiq.config import (ANOMALY_K, DEFAULT_FEATURES, HGB_DEFAULTS, EXPERIMENT_TRAIN_END,
+                             EXPERIMENT_MODELS_DIR, REPLAY_MODELS_DIR)
+from energyiq.ml.preprocess import preprocess, group_keys
 from energyiq.ml.evaluation import evaluate, decode_one_hot, TRIM_PCT, INJECT_SEED
-
-# a test residual is an anomaly when it's more than this many times its group's training MAE
-ANOMALY_K = 3
-
-# features on unless turned off with --no-<flag>
-DEFAULT_FEATURES = {
-    "electricity": {"inc_lags", "inc_breaks", "inc_weekdays"},
-    "heat": {"inc_lags", "inc_temp_history", "inc_usage_history", "inc_seasons"},
-}
-
-# best from the stage-A search; model_params passed to train() override these
-HGB_DEFAULTS = {
-    "random_state": 42,
-    "loss": "absolute_error",
-    "learning_rate": 0.1,
-    "max_iter": 200,
-    "max_leaf_nodes": 15,
-    "min_samples_leaf": 100,
-    "early_stopping": False,  # its holdout is a shuffled 10%, not time-ordered
-}
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a model for a building")
@@ -124,6 +105,11 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         help="Add a weekday flag (on by default)",
     )
+    electricity.add_argument(
+        "--events",
+        action=argparse.BooleanOptionalAction,
+        help="Add Ohio Stadium event_day and at_event flags (on by default)",
+    )
 
     return parser.parse_args()
 
@@ -150,34 +136,51 @@ def save_run(model, metrics, metadata, out_dir, metric="MAE"):
     else:
         print(f"Kept existing best {metric}: {best_score:.3f}")
 
+def save_replay_model(bundle, utility_type, train_end):
+  """Saves to REPLAY_MODELS_DIR / train_end / <utility>.joblib, overwriting an earlier replay's model."""
+  out_dir = REPLAY_MODELS_DIR / train_end
+  out_dir.mkdir(parents=True, exist_ok=True)
+  joblib.dump(bundle, out_dir / f"{utility_type}.joblib")
+  print("Saved to", out_dir / f"{utility_type}.joblib")
+
+def compute_group_mae(X_train, train_resid, utility_type):
+  """
+  Training MAE per group (meter + season for heat, meter + weekday + break for electricity),
+  and the overall training MAE as a fallback for groups never seen in training.
+  """
+  keys = group_keys(decode_one_hot(X_train, "meterid_", "only meter"), X_train.index, utility_type,
+                    X_train.get("event_day"))
+  abs_resid = np.abs(train_resid)
+  return abs_resid.groupby(keys).mean(), float(abs_resid.mean())
+
+def thresholds_for(X, group_mae, fallback_mae, utility_type, k):
+  """Per-row anomaly threshold: k x the training MAE of the row's group."""
+  # event_day is missing when it was dropped as constant (no events in X): no event groups then
+  keys = group_keys(decode_one_hot(X, "meterid_", "only meter"), X.index, utility_type, X.get("event_day"))
+  thresholds = group_mae.reindex(pd.MultiIndex.from_arrays(keys)).to_numpy()
+  return np.where(np.isnan(thresholds), fallback_mae, thresholds) * k
+
 def flag_anomalies(X_train, train_resid, X_test, test_resid, utility_type, k):
   """
-  True for test rows whose |residual| is more than k x the training MAE of their group
-  (meter + season for heat, meter + weekday + break for electricity). Thresholds come from
-  training residuals only, so no test information is used to decide what's anomalous.
+  True for test rows whose |residual| is more than k x the training MAE of their group.
+  Thresholds come from training residuals only, so no test information is used to decide
+  what's anomalous.
   """
-  train_keys = group_keys(decode_one_hot(X_train, "meterid_", "only meter"), X_train.index, utility_type)
-  test_keys = group_keys(decode_one_hot(X_test, "meterid_", "only meter"), X_test.index, utility_type)
-
-  group_mae = np.abs(train_resid).groupby(train_keys).mean()
-  thresholds = group_mae.reindex(pd.MultiIndex.from_arrays(test_keys)).to_numpy()
-  # a group never seen in training falls back to the overall training MAE
-  thresholds = np.where(np.isnan(thresholds), np.abs(train_resid).mean(), thresholds) * k
-
-  return np.abs(np.asarray(test_resid)) > thresholds
+  group_mae, fallback_mae = compute_group_mae(X_train, train_resid, utility_type)
+  return np.abs(np.asarray(test_resid)) > thresholds_for(X_test, group_mae, fallback_mae, utility_type, k)
 
 def train(model_type, utility_type, building, log_metrics,
           model_params=None, anomaly_k=ANOMALY_K, trim_pct=TRIM_PCT, **features):
   
   # linear models get one-hot hours, trees get sin/cos
   X, y, labels = preprocess(building, utility_type, baseline=model_type != "hgb",
-                            inject=True, inject_seed=INJECT_SEED, from_csv=False, **features)
+                            inject=True, inject_seed=INJECT_SEED, **features)
 
   if log_metrics:
     print(f"{len(X)} rows, {X.shape[1]} features: {list(X.columns)}")
 
   # split on dates: train on the first year, score on the test/replay year
-  train_rows = X.index < TRAIN_END
+  train_rows = X.index < EXPERIMENT_TRAIN_END
   X_train, y_train = X[train_rows], y[train_rows]
   X_test, y_test = X[~train_rows], y[~train_rows]
 
@@ -216,6 +219,37 @@ def train(model_type, utility_type, building, log_metrics,
 
   return model, metrics, list(X.columns)
 
+def train_replay(utility_type, train_end):
+  """
+  The replay model for one utility: HGB with HGB_DEFAULTS and DEFAULT_FEATURES, fit on every
+  building's readings before train_end. No test period and no injected anomalies.
+  Returned as a bundle with what AnomalyDetector needs: the model, its feature columns, and
+  the per-group training MAEs its thresholds come from.
+  """
+  features = {name: True for name in DEFAULT_FEATURES[utility_type]}
+  X, y, _ = preprocess("All", utility_type, train_end=train_end, data_end=train_end, **features)
+
+  model = HistGradientBoostingRegressor(**HGB_DEFAULTS)
+  model.fit(X, y)
+  train_resid = y - model.predict(X)
+  group_mae, fallback_mae = compute_group_mae(X, train_resid, utility_type)
+
+  return {
+    "model": model,
+    "feature_columns": list(X.columns),
+    "group_mae": group_mae,
+    "fallback_mae": fallback_mae,
+    "metadata": {
+      "utility_type": utility_type,
+      "train_end": train_end,
+      "features": features,
+      "model_params": HGB_DEFAULTS,
+      "n_train": len(X),
+      "train_MAE": fallback_mae,
+      "trained_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
+    },
+  }
+
 if __name__=="__main__":
   args = parse_args()
   all_flags = {
@@ -227,6 +261,7 @@ if __name__=="__main__":
     "inc_breaks": args.breaks,
     "inc_months": args.months,
     "inc_weekdays": args.weekdays,
+    "inc_events": args.events,
   }
   # a flag left unset (None) is on if it's a default for this utility; only the ones that
   # end up on are passed, so a heat-only flag on an electricity run still errors out
@@ -257,5 +292,5 @@ if __name__=="__main__":
         "trained_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
     }
 
-    out_dir = Path(__file__).resolve().parent / "models" / args.utility_type
+    out_dir = EXPERIMENT_MODELS_DIR / args.utility_type
     save_run(model, metrics, metadata, out_dir)

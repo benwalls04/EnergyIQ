@@ -5,7 +5,8 @@ import argparse
 import wandb
 from itertools import product
 
-from energyiq.ml.train import train, TRAIN_END, ANOMALY_K
+from energyiq.config import EXPERIMENT_TRAIN_END, ANOMALY_K
+from energyiq.ml.train import train
 from energyiq.ml.evaluation import TRIM_PCT
 
 MODELS = ["regression", "hgb"]
@@ -13,7 +14,7 @@ MODELS = ["regression", "hgb"]
 # preprocess feature flags searched in stage 0
 FEATURE_FLAGS = {
     "heat": ["inc_seasons", "inc_temp_history", "inc_usage_history"],
-    "electricity": ["inc_lags", "inc_weekends", "inc_breaks"],
+    "electricity": ["inc_lags", "inc_weekends", "inc_breaks", "inc_events"],
 }
 
 # features used in stage A, per building and utility
@@ -114,7 +115,7 @@ def log_to_wandb(args, run, model, metrics):
         "anomaly_k": ANOMALY_K,
         "trim_pct": TRIM_PCT,
         "model_params": model.get_params(),
-        "train_end": TRAIN_END,
+        "train_end": EXPERIMENT_TRAIN_END,
         "stage": args.stage,
     }
     wandb.init(project=args.project, group=f"stage{args.stage}/{args.building}",

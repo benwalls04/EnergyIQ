@@ -1,12 +1,14 @@
 from datetime import datetime
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     Double,
     ForeignKey,
     Index,
     Integer,
     Sequence,
     String,
+    false,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -75,5 +77,30 @@ class Weather(Base):
     cloud_cover: Mapped[float | None] = mapped_column(Double)
     apparent_temperature: Mapped[float | None] = mapped_column(Double)
 
+anomaly_id_seq = Sequence("seq_anomaly_id", start=1)
+
+
 class Anomaly(Base):
-    __tablename__ = "anomaly"
+    """A reading the replay flagged: its |residual| was more than k x its group's training MAE."""
+    __tablename__ = "anomalies"
+    __table_args__ = (
+        Index("idx_anomalies_building_time", "building_id", "readingtime"),
+    )
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        anomaly_id_seq,
+        server_default=anomaly_id_seq.next_value(),
+        primary_key=True,
+    )
+    meterid: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    readingtime: Mapped[datetime] = mapped_column(nullable=False)
+    building_id: Mapped[int] = mapped_column(ForeignKey("buildings.id"), nullable=False)
+    utility: Mapped[str] = mapped_column(String, nullable=False)
+    actual: Mapped[float] = mapped_column(Double, nullable=False)
+    predicted: Mapped[float] = mapped_column(Double, nullable=False)
+    residual: Mapped[float] = mapped_column(Double, nullable=False)  # actual - predicted
+    threshold: Mapped[float] = mapped_column(Double, nullable=False)
+    severity: Mapped[float] = mapped_column(Double, nullable=False)  # |residual| / threshold, so > 1
+    segment: Mapped[str] = mapped_column(String, nullable=False)  # replay batch it was found in
+    alert_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
