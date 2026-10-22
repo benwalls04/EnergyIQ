@@ -1,7 +1,7 @@
 """
 Evaluation for a trained model and its anomaly detector:
 - synthetic anomalies injected into the test period, so the detector is scored against known answers
-- accuracy on the real (non-injected) test readings, plus a trimmed MAE
+- accuracy (MAE, RMSE, R2) on the real (non-injected) test readings, largest residuals trimmed
 - detection metrics against the known anomalies (injected + drop_outliers-rule rows)
 - console breakdowns of the test MAE
 evaluate() returns every metric as one dict.
@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
-# percent of the largest test residuals dropped from trimmed_MAE
+# percent of the largest test residuals dropped before scoring accuracy
 TRIM_PCT = 2
 
 # fixed so every run is scored against the same injected anomalies
@@ -113,15 +113,13 @@ def trim_mask(y_true, y_pred, trim_pct):
 
 
 def accuracy_metrics(y_true, y_pred, trim_pct):
+    """MAE, RMSE and R2 on the rows kept after trimming the largest trim_pct% of residuals."""
     kept = trim_mask(y_true, y_pred, trim_pct)
-    mse = mean_squared_error(y_true, y_pred)
+    y_true, y_pred = y_true[kept], y_pred[kept]
     return {
-        "MSE": mse,
-        "RMSE": mse ** 0.5,
-        "R2": r2_score(y_true, y_pred),
-        "MAE": mean_absolute_error(y_true, y_pred),
-        "trimmed_MAE": mean_absolute_error(y_true[kept], y_pred[kept]),
-        "trim_pct": trim_pct,
+        "MAE": float(mean_absolute_error(y_true, y_pred)),
+        "RMSE": float(mean_squared_error(y_true, y_pred) ** 0.5),
+        "R2": float(r2_score(y_true, y_pred)),
     }
 
 
@@ -133,32 +131,37 @@ def detection_metrics(flagged, injected, outlier):
     """
     truth = (injected != "") | outlier
     tp = (flagged & truth).sum()
-    precision = tp / flagged.sum() if flagged.any() else np.nan
-    recall = tp / truth.sum() if truth.any() else np.nan
     metrics = {
         "n_anomalies": int(flagged.sum()),
-        "anomaly_rate": flagged.mean(),
         "n_labelled": int(truth.sum()),
-        "precision": precision,
-        "recall": recall,
-        "F1": 2 * precision * recall / (precision + recall) if precision + recall > 0 else np.nan,
-        "false_positive_rate": (flagged & ~truth).sum() / (~truth).sum(),
-        "recall_outlier": flagged[outlier].mean() if outlier.any() else np.nan,
+        "precision": float(tp / flagged.sum()) if flagged.any() else np.nan,
+        "false_positive_rate": float((flagged & ~truth).sum() / (~truth).sum()),
+        "recall_outlier": float(flagged[outlier].mean()) if outlier.any() else np.nan,
     }
-    # per injected kind, since spikes and dropouts can be easier or harder to catch
+    # recall per kind rather than overall, since the kinds have very different row counts
     for kind in EVENTS_PER_YEAR:
         is_kind = injected == kind
-        metrics[f"recall_{kind}"] = flagged[is_kind].mean() if is_kind.any() else np.nan
+        metrics[f"recall_{kind}"] = float(flagged[is_kind].mean()) if is_kind.any() else np.nan
     return metrics
 
 
+def flags_per_meter_week(X_test, flagged):
+    """Flagged readings per meter per week of test data: the alert volume a facilities contact would see."""
+    n_meters = len(set(decode_one_hot(X_test, "meterid_", "only meter")))
+    weeks = (X_test.index.max() - X_test.index.min()) / pd.Timedelta(weeks=1)
+    return float(flagged.sum() / n_meters / weeks)
+
+
 def print_mae_breakdowns(X_test, y_test, y_pred, building, label="all rows"):
-    """Test MAE per building and month, and per building and meter, console output only."""
+    """Overall test MAE/RMSE/R2, then MAE per building and month, and per building and meter, console output only."""
     abs_err = (y_test - y_pred).abs()
 
     # a single building or single-meter utility has no sitename/meterid columns left
     buildings = decode_one_hot(X_test, "sitename_", building)
     meters = decode_one_hot(X_test, "meterid_", "only meter")
+
+    print(f"\nTest accuracy ({label}): MAE {mean_absolute_error(y_test, y_pred):.3f}, "
+          f"RMSE {mean_squared_error(y_test, y_pred) ** 0.5:.3f}, R2 {r2_score(y_test, y_pred):.3f}")
 
     print(f"\nTest MAE by month ({label}):")
     by_month = abs_err.groupby([abs_err.index.to_period("M"), buildings]).mean()
@@ -166,6 +169,27 @@ def print_mae_breakdowns(X_test, y_test, y_pred, building, label="all rows"):
 
     print(f"\nTest MAE by meter ({label}):")
     print(abs_err.groupby([buildings, meters]).mean().round(3).to_string())
+
+    # normalized by each meter's mean usage, so meters of different sizes compare;
+    # residual = actual - predicted, so positive bias means the model under-predicts
+    resid = y_test - y_pred
+    frame = pd.DataFrame({"actual": y_test, "resid": resid, "abs": resid.abs(), "sq": resid ** 2})
+    by_meter = frame.groupby([buildings, meters])
+    mean_usage = by_meter["actual"].mean()
+    normalized = pd.DataFrame({
+        "mean_usage": mean_usage,
+        "MAE_%": by_meter["abs"].mean() / mean_usage * 100,
+        "CV(RMSE)_%": by_meter["sq"].mean() ** 0.5 / mean_usage * 100,
+        "NMBE_%": by_meter["resid"].mean() / mean_usage * 100,
+    })
+    print(f"\nNormalized error by meter ({label}; ASHRAE Guideline 14 hourly targets: "
+          f"CV(RMSE) <= 30%, NMBE within +/-10%):")
+    print(normalized.round(2).to_string())
+
+    by_month_building = frame.groupby([frame.index.to_period("M"), buildings])
+    bias = by_month_building["resid"].sum() / by_month_building["actual"].sum() * 100
+    print(f"\nBias (NMBE %) by month ({label}; positive = under-predicting):")
+    print(bias.unstack().round(2).to_string())
 
 
 def print_detection_report(X_test, flagged, injected, outlier, building):
@@ -224,13 +248,13 @@ def evaluate(X_test, y_test, y_pred, flagged, test_labels, y_train, train_pred, 
 
     metrics = {
         **accuracy_metrics(y_real, pred_real, trim_pct),
-        "train_MAE": mean_absolute_error(y_train, train_pred),
+        "train_MAE": float(mean_absolute_error(y_train, train_pred)),
         **detection_metrics(flagged, injected, outlier),
+        "flags_per_meter_week": flags_per_meter_week(X_test, flagged),
     }
 
     if verbose:
         kept = trim_mask(y_real, pred_real, trim_pct)
-        print_mae_breakdowns(X_real, y_real, pred_real, building, label="real readings")
         print_mae_breakdowns(X_real[kept], y_real[kept], pred_real[kept], building,
                              label=f"real readings, largest {trim_pct}% of residuals removed")
         print_detection_report(X_test, flagged, injected, outlier, building)

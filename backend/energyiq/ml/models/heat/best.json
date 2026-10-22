@@ -2,12 +2,10 @@
   "building": "All",
   "utility_type": "heat",
   "model_type": "hgb",
-  "half_life": null,
   "features": {
     "inc_seasons": true,
     "inc_temp_history": true,
-    "inc_usage_history": true,
-    "inc_lags": true
+    "inc_usage_history": true
   },
   "feature_columns": [
     "temperature_2m",
@@ -16,8 +14,6 @@
     "precipitation",
     "wind_speed_10m",
     "cloud_cover",
-    "lag_24h",
-    "lag_168h",
     "temp_mean_6h",
     "temp_mean_24h",
     "temp_mean_72h",
@@ -36,16 +32,25 @@
     "season_summer",
     "season_winter"
   ],
-  "trained_at": "20261017_152022",
+  "anomaly_k": 3.0,
+  "trim_pct": 2,
+  "trained_at": "20261021_224059",
   "metrics": {
-    "MSE": 1170.3533874422783,
-    "RMSE": 34.21042805114075,
-    "R2": 0.8921420365607352,
-    "MAE": 23.67391532625935,
-    "train_MAE": 17.77231522006912,
-    "n_train": 65968,
-    "n_test": 85541,
-    "n_features": 25,
-    "fit_seconds": 2.0432736999937333
+    "MAE": 24.6095263565018,
+    "RMSE": 33.947130130503325,
+    "R2": 0.9047960045801067,
+    "train_MAE": 20.653950289065804,
+    "n_anomalies": 10254,
+    "n_labelled": 716,
+    "precision": 0.05051687146479423,
+    "false_positive_rate": 0.10001232690964375,
+    "recall_outlier": 1.0,
+    "recall_spike": 0.5743243243243243,
+    "recall_dropout": 0.7542662116040956,
+    "flags_per_meter_week": 65.58999400325537,
+    "n_train": 43801,
+    "n_test": 98064,
+    "n_features": 23,
+    "fit_seconds": 1.1741792000830173
   }
 }

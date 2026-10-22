@@ -13,6 +13,15 @@ from sklearn.ensemble import HistGradientBoostingRegressor
 from energyiq.ml.preprocess import preprocess, group_keys, TRAIN_END  # one split date shared with outlier removal
 from energyiq.ml.evaluation import evaluate, decode_one_hot, TRIM_PCT, INJECT_SEED
 
+# a test residual is an anomaly when it's more than this many times its group's training MAE
+ANOMALY_K = 3
+
+# features on unless turned off with --no-<flag>
+DEFAULT_FEATURES = {
+    "electricity": {"inc_lags", "inc_breaks", "inc_weekdays"},
+    "heat": {"inc_lags", "inc_temp_history", "inc_usage_history", "inc_seasons"},
+}
+
 # best from the stage-A search; model_params passed to train() override these
 HGB_DEFAULTS = {
     "random_state": 42,
@@ -58,61 +67,62 @@ def parse_args():
     parser.add_argument(
         "--anomaly-k",
         type=float,
-        default=3,
-        help=f"Flag test residuals above k x their group's training MAE (default: {3})",
+        default=ANOMALY_K,
+        help=f"Flag test residuals above k x their group's training MAE (default: {ANOMALY_K})",
     )
     parser.add_argument(
         "--trim-pct",
         type=float,
         default=TRIM_PCT,
-        help=f"Percent of the largest test residuals dropped from trimmed_MAE (default: {TRIM_PCT})",
+        help=f"Percent of the largest test residuals dropped before scoring MAE/RMSE/R2 (default: {TRIM_PCT})",
     )
 
-    # feature flags passed through to preprocess
+    # feature flags passed through to preprocess. Each has a --no- form; left unset, it
+    # falls back to DEFAULT_FEATURES for the utility
     shared = parser.add_argument_group("heat and electricity features")
     shared.add_argument(
         "--lags",
-        action="store_true",
-        help="Add usage 24h and 168h earlier",
+        action=argparse.BooleanOptionalAction,
+        help="Add usage 24h and 168h earlier (on by default for both)",
     )
 
     heat = parser.add_argument_group("heat features")
     heat.add_argument(
         "--seasons",
-        action="store_true",
-        help="Add one-hot season columns",
+        action=argparse.BooleanOptionalAction,
+        help="Add one-hot season columns (on by default)",
     )
     heat.add_argument(
         "--months",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Add a months flag",
     )
     heat.add_argument(
         "--temp-history",
-        action="store_true",
-        help="Add rolling temperature means/min over recent hours",
+        action=argparse.BooleanOptionalAction,
+        help="Add rolling temperature means/min over recent hours (on by default)",
     )
     heat.add_argument(
         "--usage-history",
-        action="store_true",
-        help="Add the meter's mean usage over a past 24h window",
+        action=argparse.BooleanOptionalAction,
+        help="Add the meter's mean usage over a past 24h window (on by default)",
     )
 
     electricity = parser.add_argument_group("electricity features")
     electricity.add_argument(
         "--weekends",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
         help="Add an is_weekend flag",
     )
     electricity.add_argument(
         "--breaks",
-        action="store_true",
-        help="Add an in_classes flag (0 during academic breaks)",
+        action=argparse.BooleanOptionalAction,
+        help="Add an in_classes flag (0 during academic breaks) (on by default)",
     )
     electricity.add_argument(
         "--weekdays",
-        action="store_true",
-        help="Add a weekday flag",
+        action=argparse.BooleanOptionalAction,
+        help="Add a weekday flag (on by default)",
     )
 
     return parser.parse_args()
@@ -157,7 +167,7 @@ def flag_anomalies(X_train, train_resid, X_test, test_resid, utility_type, k):
   return np.abs(np.asarray(test_resid)) > thresholds
 
 def train(model_type, utility_type, building, log_metrics,
-          model_params=None, anomaly_k=3, trim_pct=TRIM_PCT, **features):
+          model_params=None, anomaly_k=ANOMALY_K, trim_pct=TRIM_PCT, **features):
   
   # linear models get one-hot hours, trees get sin/cos
   X, y, labels = preprocess(building, utility_type, baseline=model_type != "hgb",
@@ -195,7 +205,6 @@ def train(model_type, utility_type, building, log_metrics,
   metrics = {
     **evaluate(X_test, y_test, y_pred, anomalous, labels[~train_rows], y_train, train_pred,
                building, trim_pct=trim_pct, verbose=log_metrics),
-    "anomaly_k": anomaly_k,
     "n_train": len(X_train),
     "n_test": len(X_test),
     "n_features": X.shape[1],
@@ -219,7 +228,11 @@ if __name__=="__main__":
     "inc_months": args.months,
     "inc_weekdays": args.weekdays,
   }
-  feature_kwargs = {name: True for name, on in all_flags.items() if on}
+  # a flag left unset (None) is on if it's a default for this utility; only the ones that
+  # end up on are passed, so a heat-only flag on an electricity run still errors out
+  defaults = DEFAULT_FEATURES[args.utility_type]
+  feature_kwargs = {name: True for name, on in all_flags.items()
+                    if (name in defaults if on is None else on)}
 
   model, metrics, feature_columns = train(
     model_type=args.model_type,
@@ -238,8 +251,11 @@ if __name__=="__main__":
         "model_type": args.model_type,
         "features": feature_kwargs,
         "feature_columns": feature_columns,
+        # settings that shape the metrics, so runs with different ones aren't compared blindly
+        "anomaly_k": args.anomaly_k,
+        "trim_pct": args.trim_pct,
         "trained_at": datetime.now().strftime("%Y%m%d_%H%M%S"),
     }
 
-    out_dir = Path(__file__).resolve().parent / "models" / args.building / args.utility_type
+    out_dir = Path(__file__).resolve().parent / "models" / args.utility_type
     save_run(model, metrics, metadata, out_dir)

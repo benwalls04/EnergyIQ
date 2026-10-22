@@ -5,9 +5,9 @@ import argparse
 import wandb
 from itertools import product
 
-from energyiq.ml.train import train, TRAIN_END
+from energyiq.ml.train import train, TRAIN_END, ANOMALY_K
+from energyiq.ml.evaluation import TRIM_PCT
 
-HALF_LIFE = None
 MODELS = ["regression", "hgb"]
 
 # preprocess feature flags searched in stage 0
@@ -100,7 +100,6 @@ def run_config(building, run):
         utility_type=run["utility_type"],
         building=building,
         log_metrics=False,
-        half_life=HALF_LIFE,
         model_params=run.get("model_params"),
         **run["features"],
     )
@@ -112,7 +111,8 @@ def log_to_wandb(args, run, model, metrics):
         "utility": run["utility_type"],
         "model": run["model_type"],
         **run["features"],
-        "half_life": HALF_LIFE,
+        "anomaly_k": ANOMALY_K,
+        "trim_pct": TRIM_PCT,
         "model_params": model.get_params(),
         "train_end": TRAIN_END,
         "stage": args.stage,
