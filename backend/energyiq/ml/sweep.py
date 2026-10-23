@@ -2,17 +2,9 @@ import argparse
 import wandb
 from itertools import product
 
-from energyiq.config import TRAIN_END, ANOMALY_K, UTILITIES
+from energyiq.config import TRAIN_END, ANOMALY_K
 from energyiq.ml.train import train
 from energyiq.ml.evaluation import TRIM_PCT
-
-MODELS = ["regression", "hgb"]
-
-# preprocess feature flags searched in stage 0
-FEATURE_FLAGS = {
-    "heat": ["inc_seasons", "inc_temp_history", "inc_usage_history"],
-    "electricity": ["inc_lags", "inc_weekends", "inc_breaks", "inc_events"],
-}
 
 HGB_GRID = {
     "learning_rate": [0.05, 0.1],
@@ -20,46 +12,6 @@ HGB_GRID = {
     "max_leaf_nodes": [15, 31, 63],
     "min_samples_leaf": [20, 100],
 }
-
-
-def features_name(features):
-    """e.g. {"inc_lags": True, "inc_breaks": False} -> "lags"."""
-    on = [flag.removeprefix("inc_") for flag, value in features.items() if value]
-    return "+".join(on) or "none"
-
-
-def plan_stage0(building):
-    runs = []
-    for utility, flags in FEATURE_FLAGS.items():
-        for values in product([False, True], repeat=len(flags)):
-            features = dict(zip(flags, values))
-            for model_type in MODELS:
-                runs.append({
-                    "name": f"{model_type}-{utility}-{features_name(features)}",
-                    "model_type": model_type,
-                    "utility_type": utility,
-                    "features": features,
-                })
-    return runs
-
-
-def plan_stageA(building):
-    runs = []
-    for utility in UTILITIES:
-        for values in product(*HGB_GRID.values()):
-            params = dict(zip(HGB_GRID, values))
-            # HGB's built-in early stopping holds out a shuffled 10%, so turn it off
-            params["early_stopping"] = False
-            runs.append({
-                "name": f"hgb-{utility}-lr{params['learning_rate']}-it{params['max_iter']}"
-                        f"-leaves{params['max_leaf_nodes']}-msl{params['min_samples_leaf']}",
-                "model_type": "hgb",
-                "utility_type": utility,
-                "features": default_features(utility),
-                "model_params": params,
-            })
-    return runs
-
 
 def run_config(building, run):
     return train(
@@ -79,10 +31,8 @@ def log_to_wandb(args, run, model, metrics):
         "model": run["model_type"],
         **run["features"],
         "anomaly_k": ANOMALY_K,
-        "trim_pct": TRIM_PCT,
         "model_params": model.get_params(),
         "train_end": TRAIN_END,
-        "stage": args.stage,
     }
     wandb.init(project=args.project, group=f"stage{args.stage}/{args.building}",
                name=run["name"], config=config, tags=[args.building, f"stage{args.stage}"], reinit=True)
@@ -95,8 +45,6 @@ def log_to_wandb(args, run, model, metrics):
 def parse_args():
     parser = argparse.ArgumentParser(description="Grid search, logged to W&B")
     parser.add_argument("building", help="Building to sweep")
-    parser.add_argument("--stage", choices=["0", "A"], default="0",
-                        help="0: feature sets, A: HGB hyperparameters (default: 0)")
     parser.add_argument("--project", default="energyiq", help="W&B project")
     parser.add_argument("--limit", type=int, default=None,
                         help="Run only the first N configs (smoke testing)")
@@ -105,25 +53,10 @@ def parse_args():
     return parser.parse_args()
 
 
-PLANS = {"0": plan_stage0, "A": plan_stageA}
 def main():
     args = parse_args()
-    runs = PLANS[args.stage](args.building)
-    print(f"Planned: {len(runs)} runs")
-    runs = runs[:args.limit]
-
-    if args.dry_run:
-        for run in runs:
-            print(" ", run["name"])
-        return
-
-    for run in runs:
-        try:
-            model, metrics, _ = run_config(args.building, run)
-        except Exception as e:
-            print(f"FAILED {run['name']}: {e!r}")
-            continue
-        log_to_wandb(args, run, model, metrics)
+    ## work in progress
+    return 
 
 
 if __name__ == "__main__":
