@@ -52,6 +52,10 @@ class MeterReading(Base):
     utility: Mapped[str] = mapped_column(String, nullable=False)
     readingvalue: Mapped[float | None] = mapped_column(Double)
     readingunits: Mapped[str | None] = mapped_column(String)
+    # set by the replay when the reading falls outside its group's bounds
+    is_anomalous: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    # (reading - group median) / (distance from the median to that side's bound): > 1 a spike, < -1 a drop
+    severity: Mapped[float | None] = mapped_column(Double)
 
     building: Mapped[Building] = relationship(back_populates="readings")
 
@@ -77,30 +81,20 @@ class Weather(Base):
     cloud_cover: Mapped[float | None] = mapped_column(Double)
     apparent_temperature: Mapped[float | None] = mapped_column(Double)
 
-anomaly_id_seq = Sequence("seq_anomaly_id", start=1)
+class GroupThreshold(Base):
+    """
+    Fixed anomaly bounds for one group (meter, month, weekday/weekend, hour bucket), from the
+    readings before train_end. A reading outside [lower_bound, upper_bound] is flagged.
+    """
+    __tablename__ = "group_thresholds"
 
-
-class Anomaly(Base):
-    """A reading the replay flagged: its |residual| was more than k x its group's training MAE."""
-    __tablename__ = "anomalies"
-    __table_args__ = (
-        Index("idx_anomalies_building_time", "building_id", "readingtime"),
-    )
-
-    id: Mapped[int] = mapped_column(
-        Integer,
-        anomaly_id_seq,
-        server_default=anomaly_id_seq.next_value(),
-        primary_key=True,
-    )
-    meterid: Mapped[int] = mapped_column(BigInteger, nullable=False)
-    readingtime: Mapped[datetime] = mapped_column(nullable=False)
-    building_id: Mapped[int] = mapped_column(ForeignKey("buildings.id"), nullable=False)
-    utility: Mapped[str] = mapped_column(String, nullable=False)
-    actual: Mapped[float] = mapped_column(Double, nullable=False)
-    predicted: Mapped[float] = mapped_column(Double, nullable=False)
-    residual: Mapped[float] = mapped_column(Double, nullable=False)  # actual - predicted
-    threshold: Mapped[float] = mapped_column(Double, nullable=False)
-    severity: Mapped[float] = mapped_column(Double, nullable=False)  # |residual| / threshold, so > 1
-    segment: Mapped[str] = mapped_column(String, nullable=False)  # replay batch it was found in
-    alert_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
+    train_end: Mapped[str] = mapped_column(String, primary_key=True)
+    meterid: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    month: Mapped[int] = mapped_column(Integer, primary_key=True)
+    is_weekend: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hour_bucket: Mapped[int] = mapped_column(Integer, primary_key=True)  # hour // 4: 0 is midnight-3am
+    n_train: Mapped[int] = mapped_column(Integer, nullable=False)
+    k: Mapped[float] = mapped_column(Double, nullable=False)
+    median: Mapped[float] = mapped_column(Double, nullable=False)  # median training reading
+    lower_bound: Mapped[float] = mapped_column(Double, nullable=False)  # max(0, median - k * lower_spread)
+    upper_bound: Mapped[float] = mapped_column(Double, nullable=False)  # median + k * upper_spread

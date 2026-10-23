@@ -1,11 +1,8 @@
-"""Grid searches, every config logged as its own W&B run.
-Stage 0: feature sets per (utility, model) at default hyperparameters.
-Stage A: HGB hyperparameters on the default features (DEFAULT_FEATURES)."""
 import argparse
 import wandb
 from itertools import product
 
-from energyiq.config import EXPERIMENT_TRAIN_END, ANOMALY_K, UTILITIES, default_features
+from energyiq.config import TRAIN_END, ANOMALY_K, UTILITIES
 from energyiq.ml.train import train
 from energyiq.ml.evaluation import TRIM_PCT
 
@@ -84,7 +81,7 @@ def log_to_wandb(args, run, model, metrics):
         "anomaly_k": ANOMALY_K,
         "trim_pct": TRIM_PCT,
         "model_params": model.get_params(),
-        "train_end": EXPERIMENT_TRAIN_END,
+        "train_end": TRAIN_END,
         "stage": args.stage,
     }
     wandb.init(project=args.project, group=f"stage{args.stage}/{args.building}",

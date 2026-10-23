@@ -8,7 +8,7 @@ from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 
 from energyiq.config import TIME_SEGMENTS, WEATHER_DIR
-from energyiq.models import Base, Building, MeterReading, Weather
+from energyiq.models import Base, Building, GroupThreshold, MeterReading, Weather
 
 logger = logging.getLogger(__name__)
 
@@ -118,27 +118,47 @@ def insert_readings(db_path: pathlib.Path, energy_df: pd.DataFrame, weather_df: 
         engine.dispose()
 
 
-def insert_anomalies(db_path: pathlib.Path, anomaly_df: pd.DataFrame) -> None:
+def mark_anomalies(db_path: pathlib.Path, flagged_df: pd.DataFrame) -> int:
     engine = create_engine(f"duckdb:///{db_path}")
 
     try:
         with Session(engine) as session:
             duck = session.connection().connection.driver_connection
-            duck.register("anomaly_df", anomaly_df)
+            duck.register("flagged_df", flagged_df)
             try:
                 duck.execute("""
-                    INSERT INTO anomalies
-                        (meterid, readingtime, building_id, utility, actual, predicted,
-                         residual, threshold, severity, segment)
-                    SELECT a.meterid, a.readingtime, m.building_id, a.utility, a.actual, a.predicted,
-                           a.residual, a.threshold, a.severity, a.segment
-                    FROM anomaly_df a
-                    JOIN (SELECT DISTINCT meterid, building_id FROM meter_readings) m
-                    ON m.meterid = a.meterid
+                    UPDATE meter_readings AS m
+                    SET is_anomalous = TRUE, severity = f.severity
+                    FROM flagged_df f
+                    WHERE m.meterid = f.meterid AND m.readingtime = f.readingtime
                 """)
             finally:
-                duck.unregister("anomaly_df")
+                duck.unregister("flagged_df")
 
             session.commit()
+            return len(flagged_df)
+    finally:
+        engine.dispose()
+
+
+def insert_thresholds(db_path: pathlib.Path, thresholds_df: pd.DataFrame, train_end: str, k: float) -> int:
+    """Replaces the group thresholds stored for train_end. Returns the number of rows written."""
+    engine = create_engine(f"duckdb:///{db_path}")
+
+    try:
+        # databases built before this table existed get it here
+        Base.metadata.create_all(engine, tables=[GroupThreshold.__table__])
+        with Session(engine) as session:
+            duck = session.connection().connection.driver_connection
+            duck.register("thresholds_df", thresholds_df.assign(train_end=train_end, k=k))
+            try:
+                duck.execute("DELETE FROM group_thresholds WHERE train_end = ?", [train_end])
+                cols = ", ".join(f'"{c.name}"' for c in GroupThreshold.__table__.columns)
+                duck.execute(f"INSERT INTO group_thresholds ({cols}) SELECT {cols} FROM thresholds_df")
+            finally:
+                duck.unregister("thresholds_df")
+
+            session.commit()
+            return len(thresholds_df)
     finally:
         engine.dispose()

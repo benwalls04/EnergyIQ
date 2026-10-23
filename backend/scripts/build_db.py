@@ -1,8 +1,10 @@
 # scripts/build_db.py
-from energyiq.config import DB_PATH, DATA_DIR, TIME_SEGMENTS, UTILITIES, REPLAY_INIT_TRAIN_END, REPLAY_MODELS_DIR
-from energyiq.ingest import load_meter_readings_df, load_weather_df, build_database, insert_readings, insert_anomalies
+from energyiq.config import DB_PATH, DATA_DIR, TIME_SEGMENTS, TRAIN_END, ANOMALY_K
+from energyiq.ingest import load_meter_readings_df, load_weather_df, build_database, insert_readings, \
+    insert_thresholds, mark_anomalies
+from energyiq.ml.preprocess import preprocess_window
 from energyiq.ml.train import train_replay, save_replay_model
-from energyiq.anomaly_detector import AnomalyDetector
+from energyiq.ml.thresholds import flag_anomalies
 import argparse
 
 def build_full() -> None:
@@ -12,27 +14,29 @@ def build_full() -> None:
     build_database(DB_PATH, energy_df, weather_df)
     print(f"Wrote {DB_PATH}")
 
-def train_replay_models(train_end):
-    for u in UTILITIES:
-        print(f"\n-- training {u} (data before {train_end}) --")
-        save_replay_model(train_replay(u, train_end), u, train_end)
-    return REPLAY_MODELS_DIR / train_end
+def train_and_store(train_end):
+    """Trains on everything before train_end, saves the model and writes its thresholds to the DB."""
+    print(f"\n-- training on data before {train_end} --")
+    bundle, thresholds = train_replay(train_end)
+    save_replay_model(bundle, train_end)
+    n = insert_thresholds(DB_PATH, thresholds, train_end, ANOMALY_K)
+    print(f"wrote {n} group thresholds (train_end {train_end})")
+    return bundle, thresholds
 
 def build_with_replays() -> None:
-    # initial state: the first year of data, and models trained on it
-    print(f"\n{'=' * 60}\nINITIAL STATE: data before {REPLAY_INIT_TRAIN_END}\n{'=' * 60}")
+    # initial state: the data before TRAIN_END, and a model trained on it
+    print(f"\n{'=' * 60}\nINITIAL STATE: data before {TRAIN_END}\n{'=' * 60}")
     build_database(
         DB_PATH,
-        load_meter_readings_df(DATA_DIR, end=REPLAY_INIT_TRAIN_END),
-        load_weather_df(DATA_DIR, end=REPLAY_INIT_TRAIN_END),
+        load_meter_readings_df(DATA_DIR, end=TRAIN_END),
+        load_weather_df(DATA_DIR, end=TRAIN_END),
     )
-    model_dir = train_replay_models(REPLAY_INIT_TRAIN_END)
+    bundle, thresholds = train_and_store(TRAIN_END)
 
-    # each later segment is a batch: add its readings and weather to the DB, detect on it with the
-    # models trained before it, add its anomalies, then retrain on everything so far (minus the
-    # anomalies) for the next batch. The last models are kept as the current ones
+    # each later segment is a batch: add its readings to the DB, flag them with the model and
+    # thresholds trained before it, then retrain on everything so far for the next batch
     for folder, start, end in TIME_SEGMENTS:
-        if start < REPLAY_INIT_TRAIN_END:
+        if start < TRAIN_END:
             continue
         print(f"\n{'=' * 60}\nBATCH {folder}: {start} to {end}\n{'=' * 60}")
 
@@ -43,12 +47,12 @@ def build_with_replays() -> None:
             load_weather_df(DATA_DIR, start, end),
         )
 
-        print(f"\n-- detecting anomalies with {model_dir.name} models --")
-        anomalies = AnomalyDetector(model_dir).get_anomalies(start, end)
-        insert_anomalies(DB_PATH, anomalies.assign(segment=folder))
-        print(f"{folder}: {len(anomalies)} anomalies")
+        print(f"\n-- flagging with the {bundle['train_end']} thresholds --")
+        _, y, meta = preprocess_window(start, end)
+        n = mark_anomalies(DB_PATH, flag_anomalies(meta, y, thresholds))
+        print(f"{folder}: {n} of {len(y)} readings flagged ({n / len(y):.2%})")
 
-        model_dir = train_replay_models(end)
+        bundle, thresholds = train_and_store(end)
     print(f"\n{'=' * 60}\nDONE: wrote {DB_PATH}\n{'=' * 60}")
 
 
@@ -57,7 +61,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--replay",
         action="store_true",
-        help="Build the database one segment at a time, detecting anomalies and retraining between segments"
+        help="Build the database one segment at a time, flagging anomalies and retraining between segments"
     )
     args = parser.parse_args()
     if args.replay:
