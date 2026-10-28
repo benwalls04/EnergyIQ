@@ -49,6 +49,10 @@ def save_run(model, metrics, metadata, out_dir, metric="MAE"):
     else:
         print(f"Kept existing best {metric}: {best_score:.3f}")
 
+def predict(model, X):
+    """Predictions for X, its dummy columns lined up with the ones the model was fit on."""
+    return model.predict(X.reindex(columns=model.feature_names_in_, fill_value=0))
+
 def train(log_metrics, model_params=None):
     X, y, meta = preprocess()
 
@@ -61,7 +65,7 @@ def train(log_metrics, model_params=None):
     model.fit(X_train, y_train)
     y_pred = model.predict(X_test)
     train_pred = model.predict(X_train)
-    thresholds = fit_thresholds(meta_train, y_train, ANOMALY_K)
+    thresholds = fit_thresholds(meta_train, y_train - train_pred, ANOMALY_K)
 
     metrics = {
         **evaluate(y_test, y_pred, y_train, train_pred, meta_test, verbose=log_metrics),
@@ -81,7 +85,7 @@ def train_replay(train_end):
 
     model = HistGradientBoostingRegressor(**HGB_DEFAULTS)
     model.fit(X, y)
-    thresholds = fit_thresholds(meta, y, ANOMALY_K)
+    thresholds = fit_thresholds(meta, y - model.predict(X), ANOMALY_K)
 
     bundle = {"model": model, "train_end": train_end}
     return bundle, thresholds

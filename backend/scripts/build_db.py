@@ -3,7 +3,7 @@ from energyiq.config import DB_PATH, DATA_DIR, TIME_SEGMENTS, TRAIN_END, ANOMALY
 from energyiq.ingest import load_meter_readings_df, load_weather_df, build_database, insert_readings, \
     insert_thresholds, mark_anomalies
 from energyiq.ml.preprocess import preprocess_window
-from energyiq.ml.train import train_replay, save_replay_model
+from energyiq.ml.train import train_replay, save_replay_model, predict
 from energyiq.ml.thresholds import flag_anomalies
 import argparse
 
@@ -47,9 +47,10 @@ def build_with_replays() -> None:
             load_weather_df(DATA_DIR, start, end),
         )
 
-        print(f"\n-- flagging with the {bundle['train_end']} thresholds --")
-        _, y, meta = preprocess_window(start, end)
-        n = mark_anomalies(DB_PATH, flag_anomalies(meta, y, thresholds))
+        print(f"\n-- flagging with the {bundle['train_end']} model and thresholds --")
+        X, y, meta = preprocess_window(start, end)
+        y_pred = predict(bundle["model"], X)
+        n = mark_anomalies(DB_PATH, flag_anomalies(meta, y, y_pred, thresholds))
         print(f"{folder}: {n} of {len(y)} readings flagged ({n / len(y):.2%})")
 
         bundle, thresholds = train_and_store(end)

@@ -54,7 +54,7 @@ class MeterReading(Base):
     readingunits: Mapped[str | None] = mapped_column(String)
     # set by the replay when the reading falls outside its group's bounds
     is_anomalous: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
-    # (reading - group median) / (distance from the median to that side's bound): > 1 a spike, < -1 a drop
+    # (residual - group median residual) / (that side's k-scaled spread): > 1 a spike, < -1 a drop
     severity: Mapped[float | None] = mapped_column(Double)
 
     building: Mapped[Building] = relationship(back_populates="readings")
@@ -83,8 +83,9 @@ class Weather(Base):
 
 class GroupThreshold(Base):
     """
-    Fixed anomaly bounds for one group (meter, month, weekday/weekend, hour bucket), from the
-    readings before train_end. A reading outside [lower_bound, upper_bound] is flagged.
+    Anomaly bounds on the model's residuals (actual - predicted) for one group (meter, month,
+    weekday/weekend, hour bucket), from the readings before train_end. A reading is flagged when its
+    residual is outside [median - lower_bound, median + upper_bound].
     """
     __tablename__ = "group_thresholds"
 
@@ -95,6 +96,6 @@ class GroupThreshold(Base):
     hour_bucket: Mapped[int] = mapped_column(Integer, primary_key=True)  # hour // 4: 0 is midnight-3am
     n_train: Mapped[int] = mapped_column(Integer, nullable=False)
     k: Mapped[float] = mapped_column(Double, nullable=False)
-    median: Mapped[float] = mapped_column(Double, nullable=False)  # median training reading
-    lower_bound: Mapped[float] = mapped_column(Double, nullable=False)  # max(0, median - k * lower_spread)
-    upper_bound: Mapped[float] = mapped_column(Double, nullable=False)  # median + k * upper_spread
+    median: Mapped[float] = mapped_column(Double, nullable=False)  # median training residual
+    lower_bound: Mapped[float] = mapped_column(Double, nullable=False)  # k * lower residual spread
+    upper_bound: Mapped[float] = mapped_column(Double, nullable=False)  # k * upper residual spread
