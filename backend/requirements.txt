@@ -5,3 +5,7 @@ pandas
 scikit-learn
 ipykernel
 wandb
+fastapi
+uvicorn
+pytest
+httpx
