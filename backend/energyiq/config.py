@@ -21,7 +21,7 @@ HGB_DEFAULTS = {
     "early_stopping": False, 
 }
 
-ANOMALY_K = 10
+ANOMALY_K = 15
 
 TRAIN_END = "2025-09-01"
 

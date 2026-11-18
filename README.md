@@ -4,11 +4,11 @@ Flags unusual hourly energy use for three campus buildings (Ohio Stadium, Thomps
 
 ## The approach
 
-The pipeline has three steps. **Steps 1 and 2 are built; step 3 is next.**
+The pipeline has three steps, and all three are built.
 
 1. **Expected usage (model).** One gradient-boosted tree model (`HistGradientBoostingRegressor`) covers every building and utility. It predicts each meter's usage from calendar and ID features only: season, weekday vs. weekend, hour bucket, utility, meter, building, and hour/month as sine/cosine. It doesn't use weather or occupancy. The model gives the dashboard its "expected" line. The goal is a reasonable baseline, **not** the lowest possible error. A model fitted too closely would learn game days and cold snaps as normal, and then couldn't flag them.
 2. **Candidate anomalies (thresholds).** Readings are split into **groups**: meter × month × weekday/weekend × hour bucket. Each group gets a fixed lower and upper bound from its training readings. A reading outside its group's bounds is flagged as a *candidate* anomaly.
-3. **Events (LLM, not built yet).** An LLM will merge the candidates into real events (e.g. "Scott House heat ran high all weekend") and write the alert summaries.
+3. **Events (LLM).** Claude merges the candidates into events (e.g. "Scott House heat ran high all weekend"), gives each a low/medium/high severity, and writes the alert text. Candidates that don't end up in an event are unflagged. See [Loading the LLM events](#loading-the-llm-events).
 
 ### How the bounds are calculated
 
@@ -94,14 +94,42 @@ Each training run also saves its model to `energyiq/ml/models/replay/<train_end>
 
 To browse the database, install the **DuckDB** VS Code extension, then run **DuckDB: Select Database → Attach** on `data/db/energyiq.duckdb`. Detach it before rebuilding.
 
+## Loading the LLM events
+
+`scripts/generate_emails.py` sends each building's flagged readings to Claude in headless mode (`claude -p`), one utility and one calendar month at a time. Claude groups them into events, and the results are saved to a JSON log in `scripts/logs/`. Making the log needs Claude Code installed and signed in, so only one person runs that part. The finished log is committed, and everyone else loads it into their own database.
+
+After a `--replay` build, run:
+
+```bash
+python -m scripts.generate_emails --resume scripts/logs/emails_20261118_140322.json
+```
+
+Every batch is already in the log, so this makes no Claude calls. It goes straight to the database step, which:
+
+1. Creates the `events` table and the `meter_readings.event_id` column if they're missing.
+2. Replaces any events from an earlier load with the ones in the log.
+3. Sets `event_id` on every reading that belongs to an event.
+4. Sets `is_anomalous = false` and `severity = null` on every flagged reading that isn't in an event.
+
+You should see `resuming ...: N batches already done`, then three lines: events inserted, readings linked/skipped, and readings unflagged. A few skipped readings are normal.
+
+Gotchas:
+
+- **Do a fresh `--replay` build first, with the committed `config.py`.** The log only matches the anomalies that build flags. If yours flags anomalies the log has no batch for, the script tries to call Claude for them and fails.
+- **Step 4 can't be undone.** To get the original candidates back, rerun `python -m scripts.build_db --replay`.
+- **Rerunning is safe.** It reloads the same events, but they get new `id`s, so don't hard-code event ids anywhere.
+
 ## Database tables
 
 | Table | Contents |
 |---|---|
 | `buildings` | `id`, `sitename`, `simscode` |
-| `meter_readings` | One row per meter per reading: `meterid`, `readingtime`, `building_id`, `utility` (`ELECTRICITY`, `HEAT`, ...), `readingvalue`, `readingunits`, **`is_anomalous`**, **`severity`** (null unless flagged) |
+| `meter_readings` | One row per meter per reading: `meterid`, `readingtime`, `building_id`, `utility` (`ELECTRICITY`, `HEAT`, ...), `readingvalue`, `readingunits`, **`is_anomalous`**, **`severity`** (null unless flagged), **`event_id`** (the event the reading belongs to, null otherwise) |
+| `events` | One row per LLM event: `id`, `title`, `description`, `likely_causes`, `severity` (`low`/`medium`/`high`), `severity_reason`, `utility`, `building_id`, `start_time`, `end_time`, `email_sent` |
 | `weather` | Hourly campus weather. Loaded, but not used by the model right now |
 | `group_thresholds` | One row per group per training run: `train_end`, `meterid`, `month`, `is_weekend`, `hour_bucket`, `n_train`, `k`, `median`, `lower_bound`, `upper_bound` |
+
+`meter_readings.event_id` points at `events.id`, but it has no foreign key constraint, because DuckDB can't delete events that rows still point to, even after `event_id` has been cleared in the same transaction. Join on it as usual.
 
 The `group_thresholds` rows for `train_end = X` are the bounds used to flag the segment that starts at `X`. The last `train_end` (`2026-09-01`) is the "current" set, trained on all the data.
 
@@ -165,7 +193,10 @@ backend/
 │       ├── evaluation.py   # metrics and the -v breakdown
 │       ├── sweep.py        # W&B hyperparameter sweeps (out of date, being reworked)
 │       └── models/replay/  # models saved by --replay
-├── scripts/build_db.py     # builds the database (plain or --replay)
+├── scripts/
+│   ├── build_db.py         # builds the database (plain or --replay)
+│   ├── generate_emails.py  # groups candidates into events with Claude, loads them into the database
+│   └── logs/               # event logs from generate_emails (the committed one is loaded with --resume)
 └── requirements.txt
 data/
 ├── raw/                    # source CSVs: one folder per 6-month segment + weather_data/
@@ -174,8 +205,7 @@ data/
 
 ## Not done yet
 
-- LLM step: merge candidates into events and write alert summaries (step 3).
-- Simulated alert emails.
+- Simulated alert emails (the events table has the text; nothing sends it yet).
 - Dashboard.
 - `sweep.py` still targets the old training setup.
 
