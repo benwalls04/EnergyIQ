@@ -23,7 +23,6 @@ def fit_thresholds(meta_train, residuals, k=ANOMALY_K):
     groups = frame["r"].groupby(keys)
     dev = frame["r"] - groups.transform("median")
 
-    # a side with no deviations at all has a NaN median, so a spread of 0
     lower_spread = (-dev).where(dev < 0).groupby(keys).median().fillna(0)
     upper_spread = dev.where(dev > 0).groupby(keys).median().fillna(0)
 

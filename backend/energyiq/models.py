@@ -56,6 +56,7 @@ class MeterReading(Base):
     is_anomalous: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     # (residual - group median residual) / (that side's k-scaled spread): > 1 a spike, < -1 a drop
     severity: Mapped[float | None] = mapped_column(Double)
+    event_id: Mapped[int | None] = mapped_column(Integer)
 
     building: Mapped[Building] = relationship(back_populates="readings")
 
@@ -99,3 +100,27 @@ class GroupThreshold(Base):
     median: Mapped[float] = mapped_column(Double, nullable=False)  # median training residual
     lower_bound: Mapped[float] = mapped_column(Double, nullable=False)  # k * lower residual spread
     upper_bound: Mapped[float] = mapped_column(Double, nullable=False)  # k * upper residual spread
+
+
+event_id_seq = Sequence("seq_event_id", start=1)
+
+
+class Event(Base):
+    __tablename__ = "events"
+
+    id: Mapped[int] = mapped_column(
+        Integer,
+        event_id_seq,
+        server_default=event_id_seq.next_value(),
+        primary_key=True,
+    )
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[str] = mapped_column(String, nullable=False)
+    likely_causes: Mapped[str] = mapped_column(String, nullable=False)
+    severity: Mapped[str] = mapped_column(String, nullable=False)
+    severity_reason: Mapped[str] = mapped_column(String, nullable=False)
+    utility: Mapped[str] = mapped_column(String, nullable=False)
+    building_id: Mapped[int] = mapped_column(ForeignKey("buildings.id"), nullable=False)
+    start_time: Mapped[datetime] = mapped_column(nullable=False)
+    end_time: Mapped[datetime] = mapped_column(nullable=False)
+    email_sent: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
