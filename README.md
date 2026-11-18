@@ -101,7 +101,7 @@ To browse the database, install the **DuckDB** VS Code extension, then run **Duc
 After a `--replay` build, run:
 
 ```bash
-python -m scripts.generate_emails --resume scripts/logs/emails_20261118_140322.json
+python -m scripts.generate_emails --resume scripts/logs/emails.json
 ```
 
 Every batch is already in the log, so this makes no Claude calls. It goes straight to the database step, which:
