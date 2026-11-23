@@ -56,6 +56,7 @@ class MeterReading(Base):
     is_anomalous: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=false())
     # (residual - group median residual) / (that side's k-scaled spread): > 1 a spike, < -1 a drop
     severity: Mapped[float | None] = mapped_column(Double)
+    predictedvalue: Mapped[float | None] = mapped_column(Double)
     event_id: Mapped[int | None] = mapped_column(Integer)
 
     building: Mapped[Building] = relationship(back_populates="readings")

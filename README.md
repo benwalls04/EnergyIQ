@@ -67,7 +67,7 @@ It feeds the data in one 6-month segment at a time (`TIME_SEGMENTS` in `config.p
 1. **Starting state.** Loads everything before `TRAIN_END` (`2025-09-01`, i.e. Sep 2023 – Aug 2025). Trains the model, computes thresholds, and saves both. Nothing in this period is flagged; it's the starting history.
 2. **For each later segment** (`sept2025-feb2026`, then `march2026-sept2026`):
    1. Inserts the segment's readings and weather.
-   2. Flags them using the thresholds trained **before** the segment, which guarantees no lookahead. Flagged rows get `is_anomalous = true` and a `severity`.
+   2. Flags them using the thresholds trained **before** the segment, which guarantees no lookahead. Every row gets that model's `predictedvalue`, and flagged rows also get `is_anomalous = true` and a `severity`.
    3. Retrains on everything so far, flagged readings included, and writes a new set of thresholds keyed by the segment's end date.
 
 The output looks like this:
@@ -124,7 +124,7 @@ Gotchas:
 | Table | Contents |
 |---|---|
 | `buildings` | `id`, `sitename`, `simscode` |
-| `meter_readings` | One row per meter per reading: `meterid`, `readingtime`, `building_id`, `utility` (`ELECTRICITY`, `HEAT`, ...), `readingvalue`, `readingunits`, **`is_anomalous`**, **`severity`** (null unless flagged), **`event_id`** (the event the reading belongs to, null otherwise) |
+| `meter_readings` | One row per meter per reading: `meterid`, `readingtime`, `building_id`, `utility` (`ELECTRICITY`, `HEAT`, ...), `readingvalue`, `readingunits`, **`is_anomalous`**, **`severity`** (null unless flagged), **`predictedvalue`** (the model's expected `readingvalue`, set by `--replay` for readings from `TRAIN_END` on, null otherwise), **`event_id`** (the event the reading belongs to, null otherwise) |
 | `events` | One row per LLM event: `id`, `title`, `description`, `likely_causes`, `severity` (`low`/`medium`/`high`), `severity_reason`, `utility`, `building_id`, `start_time`, `end_time`, `email_sent` |
 | `weather` | Hourly campus weather. Loaded, but not used by the model right now |
 | `group_thresholds` | One row per group per training run: `train_end`, `meterid`, `month`, `is_weekend`, `hour_bucket`, `n_train`, `k`, `median`, `lower_bound`, `upper_bound` |

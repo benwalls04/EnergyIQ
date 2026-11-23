@@ -141,6 +141,29 @@ def mark_anomalies(db_path: pathlib.Path, flagged_df: pd.DataFrame) -> int:
         engine.dispose()
 
 
+def write_predictions(db_path: pathlib.Path, predictions_df: pd.DataFrame) -> int:
+    engine = create_engine(f"duckdb:///{db_path}")
+
+    try:
+        with Session(engine) as session:
+            duck = session.connection().connection.driver_connection
+            duck.register("predictions_df", predictions_df)
+            try:
+                duck.execute("""
+                    UPDATE meter_readings AS m
+                    SET predictedvalue = p.predictedvalue
+                    FROM predictions_df p
+                    WHERE m.meterid = p.meterid AND m.readingtime = p.readingtime
+                """)
+            finally:
+                duck.unregister("predictions_df")
+
+            session.commit()
+            return len(predictions_df)
+    finally:
+        engine.dispose()
+
+
 def insert_thresholds(db_path: pathlib.Path, thresholds_df: pd.DataFrame, train_end: str, k: float) -> int:
     """Replaces the group thresholds stored for train_end. Returns the number of rows written."""
     engine = create_engine(f"duckdb:///{db_path}")
