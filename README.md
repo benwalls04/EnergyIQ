@@ -119,6 +119,20 @@ Gotchas:
 - **Step 4 can't be undone.** To get the original candidates back, rerun `python -m scripts.build_db --replay`.
 - **Rerunning is safe.** It reloads the same events, but they get new `id`s, so don't hard-code event ids anywhere.
 
+## Dashboard
+
+Once everything has been created and the events are cleaned up, you can run the dashboard with:
+
+```bash
+streamlit run scripts/Dashboard.py
+```
+This will launch the app in your default browser at `http://localhost:8501`
+
+Notes:
+
+- This currently pulls the usage data from `raw`.
+- It will stop working if moved from `scripts`.
+
 ## Database tables
 
 | Table | Contents |
