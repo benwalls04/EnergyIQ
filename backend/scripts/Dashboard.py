@@ -1,11 +1,13 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import duckdb
+import os
+import re
 import matplotlib.pyplot as plt
 from matplotlib.ticker import FuncFormatter
+from matplotlib.lines import Line2D
 from pathlib import Path
-import os
-import duckdb
 
 # DATA PROCESSING FLOW
 # --------------------
@@ -31,6 +33,8 @@ st.set_page_config(page_title="Energy Usage Dashboard", layout="wide")
 # FORMATTING
 # ----------------------------------------------------
 
+EVENT_MARKER_COLOR = "#FFD700"
+
 def format_short(value):
     if value >= 1_000_000:
         return f"{value/1_000_000:.1f}M"
@@ -39,6 +43,86 @@ def format_short(value):
     else:
         return f"{value:.0f}"
 
+def plot_event_markers(ax, x, data, event_mask):
+
+    if not event_mask.any():
+        return
+
+    marker_y = (data.loc[event_mask, "Usage"] * 0.97)
+
+    ax.scatter(
+        x[event_mask],
+        marker_y,
+        marker="^",
+        color=EVENT_MARKER_COLOR,
+        edgecolor="black",
+        s=200,
+        zorder=10
+    )
+
+    for xi, yi in zip(
+        x[event_mask],
+        marker_y
+    ):
+        ax.text(
+            xi,
+            yi - (yi * 0.01),
+            "!",
+            ha="center",
+            va="center",
+            color="black",
+            fontsize=11,
+            fontweight="bold",
+            zorder=11
+        )
+
+def display_event_table(visible_events):
+    if visible_events.empty:
+        return
+        
+    event_table = (
+            visible_events[
+                ["title", "description", "start_time", "meterid"]
+            ]
+            .sort_values("start_time")
+            .copy()
+        )
+
+    event_table["start_time"] = (
+        event_table["start_time"]
+        .dt.strftime("%Y-%m-%d %H:%M")
+    )
+
+    event_table = event_table.rename(
+        columns={
+            "title": "Short Description",
+            "description": "Details",
+            "start_time": "Start Time",
+            "meterid": "Meter ID"
+        }
+    )
+
+    st.subheader("Alerts in Current View")
+
+    event_table["Meter ID"] = (
+        event_table["Meter ID"]
+        .astype(str)
+    )
+
+    st.data_editor(
+        event_table,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Start Time": st.column_config.TextColumn(
+                width="small"
+            ),
+            "Meter ID": st.column_config.TextColumn(
+                width="small"
+            ),
+        },
+        disabled=True
+    )
 
 def format_axis(value, pos):
     return f"{value:,.0f}"
@@ -115,6 +199,35 @@ def load_data(data_folder):
 
     return df, len(csv_files)
 
+@st.cache_data
+def load_db_data(db_path):
+    con = duckdb.connect(db_path)
+
+    predicted_df = con.execute("""
+        SELECT DISTINCT
+            meterid,
+            readingtime,
+            predictedvalue
+        FROM meter_readings
+        WHERE predictedvalue IS NOT NULL
+    """).fetch_df()
+    
+    predicted_df["readingtime"] = pd.to_datetime(predicted_df["readingtime"])
+
+    events_df = con.execute("""
+        SELECT
+            title,
+            description,
+            start_time
+        FROM events
+        WHERE start_time IS NOT NULL
+    """).fetch_df()
+
+    events_df["start_time"] = pd.to_datetime(events_df["start_time"],errors="coerce")
+
+    con.close()
+    
+    return predicted_df, events_df
 
 project_folder = Path(__file__).resolve().parents[2]
 data_folder = project_folder / "data/raw"
@@ -128,29 +241,36 @@ if df is None:
 st.sidebar.success(f"Loaded {file_count} CSV file(s)")
 
 # ------------------------------------------------
-# PULL PREDICTIONS FROM DB
+# PULL PREDICTIONS AND ALERTS FROM DB
 # ------------------------------------------------
 
-con = duckdb.connect(project_folder / "data/db/energyiq.duckdb")
-
-predicted_df = con.execute("""
-    SELECT DISTINCT
-        meterid,
-        readingtime,
-        predictedvalue
-    FROM meter_readings
-    WHERE predictedvalue IS NOT NULL
-""").fetch_df()
-
-con.close()
+predicted_df, events_df = load_db_data(project_folder / "data/db/energyiq.duckdb")
 
 df["meterid"] = df["meterid"].astype(str)
 predicted_df["meterid"] = predicted_df["meterid"].astype(str)
 
 df[date_col] = pd.to_datetime(df[date_col])
-predicted_df[date_col] = pd.to_datetime(predicted_df[date_col])
 
 df = df.merge(predicted_df, on=["meterid", date_col], how="left")
+
+events_df["meterids"] = (
+    events_df["description"]
+    .fillna("")
+    .apply(lambda x: re.findall(r"\b\d{6}\b", x))
+)
+
+event_meter_df = (
+    events_df
+    .explode("meterids")
+    .rename(columns={"meterids": "meterid"})
+)
+
+event_meter_df["meterid"] = pd.to_numeric(
+    event_meter_df["meterid"],
+    errors="coerce"
+)
+
+event_meter_df["event_date"] = (event_meter_df["start_time"].dt.normalize())
 
 # ------------------------------------------------
 # SIDEBAR FILTERS
@@ -162,32 +282,39 @@ site_name = "Multiple Buildings"
 building_options = ["All Buildings"] + sorted(df["sitename"].dropna().unique().tolist())
 selected_building = st.sidebar.selectbox("Building", building_options)
 
-meter_lookup = df.groupby("meterid", as_index=False).agg(utility=("utility", "first"))
-meter_options = {"All Meters": None}
-selected_label = st.sidebar.selectbox("Meter", list(meter_options.keys()))
-selected_meter = meter_options[selected_label]
+if selected_building != "All Buildings":
+    df = df[df["sitename"] == selected_building]
 
 years = sorted(df[date_col].dt.year.dropna().unique().tolist())
 selected_year = st.sidebar.selectbox("Year", ["All Years"] + [str(y) for y in years])
 
+if selected_year != "All Years":
+    df = df[df[date_col].dt.year == int(selected_year)]
+
 utility_options = ["All Utilities"] + sorted(df["utility"].dropna().unique().tolist())
 selected_utility = st.sidebar.selectbox("Utility Type", utility_options)
 
-if selected_building != "All Buildings":
-    df = df[df["sitename"] == selected_building]
+if selected_utility != "All Utilities":
+    df = df[df["utility"] == selected_utility]
+
+meter_lookup = df.groupby("meterid", as_index=False).agg(utility=("utility", "first"))
+meter_options = {"All Meters": None}
 
 for _, row in meter_lookup.iterrows():
     label = f"{row['utility']} - {row['meterid']}"
     meter_options[label] = str(row["meterid"])
 
+selected_label = st.sidebar.selectbox("Meter", list(meter_options.keys()))
+selected_meter = meter_options[selected_label]
+
 if selected_meter is not None:
     df = df[df["meterid"].astype(str) == selected_meter]
 
-if selected_year != "All Years":
-    df = df[df[date_col].dt.year == int(selected_year)]
+visible_meterids = set(df["meterid"].astype(str).unique())
 
-if selected_utility != "All Utilities":
-    df = df[df["utility"] == selected_utility]
+meter_events = event_meter_df[
+    event_meter_df["meterid"].astype(str).isin(visible_meterids)
+]
 
 # Map user-friendly names shown in the sidebar
 
@@ -224,10 +351,10 @@ header_col1, header_col2 = st.columns([1, 5])
 
 with header_col1:
     st.image(project_folder / "Logo.png", width=120)
+    st.subheader(selected_building)
 
 with header_col2:
     st.title("Energy Usage Dashboard")
-    st.subheader(selected_building)
 
 # Combine duplicate timestamps and group by hour
 
@@ -305,12 +432,19 @@ st.sidebar.header("Navigation")
 
 if selected_year == "All Years":
     selected_month_label = "Monthly Summary"
+    
+    event_periods = set(meter_events["start_time"].dt.year)
+    event_mask = monthly_data["Year"].isin(event_periods)
+    
 else:
     month_labels = monthly_data["MonthLabel"].tolist()
 
     selected_month_label = st.sidebar.selectbox(
         "Month", ["Monthly Summary"] + month_labels
     )
+    
+    event_periods = set(meter_events["start_time"].dt.to_period("M"))
+    event_mask = monthly_data["Month"].isin(event_periods)
 
 # =================================================
 # MONTHLY VIEW
@@ -353,6 +487,8 @@ if selected_month_label == "Monthly Summary":
         label="Actual",
     )
 
+    plot_event_markers(ax, x, monthly_data, event_mask)
+
     if show_predictions and pred_mask.any():
         predicted_bars = ax.bar(
             x[pred_mask] + width / 2,
@@ -377,8 +513,23 @@ if selected_month_label == "Monthly Summary":
 
     handles, labels = ax.get_legend_handles_labels()
 
+    if event_mask.any():
+        handles.append(
+            Line2D(
+                [],
+                [],
+                marker="^",
+                markersize=10,
+                markerfacecolor=EVENT_MARKER_COLOR,
+                markeredgecolor="black",
+                linestyle="None",
+                label="Alert"
+            )
+        )
+        labels.append("Alert")
+
     if handles:
-        ax.legend()
+        ax.legend(handles, labels)
 
     if selected_year == "All Years":
         ax.set_title(f"{aggregation_label} Usage by Year (kWh)")
@@ -408,6 +559,30 @@ if selected_month_label == "Monthly Summary":
 
     st.pyplot(fig)
 
+    # ------------------------------------------------
+    # Determine if events are visible in view
+    # ------------------------------------------------
+
+    if selected_year == "All Years":
+
+        visible_events = meter_events[
+            meter_events["start_time"].dt.year.isin(
+                monthly_data["Year"]
+            )
+        ]
+
+    else:
+
+        visible_months = set(monthly_data["Month"])
+
+        visible_events = meter_events[
+            meter_events["start_time"].dt.to_period("M").isin(
+                visible_months
+            )
+        ]
+
+    display_event_table(visible_events)
+
 # =================================================
 # DAILY / HOURLY DRILLDOWN
 # =================================================
@@ -424,12 +599,22 @@ else:
     ]
 
     daily_data = (
-        month_data.assign(Day=month_data[date_col].dt.day)
+        month_data.assign(
+            Day=month_data[date_col].dt.day
+        )
         .groupby("Day", as_index=False)
         .agg(
             Usage=(usage_col, agg_function),
             Predicted=(pred_col, agg_function)
-            )
+        )
+    )
+
+    daily_data["EventDate"] = pd.to_datetime(
+        {
+            "year": selected_month_date.year,
+            "month": selected_month_date.month,
+            "day": daily_data["Day"]
+        }
     )
 
     available_days = daily_data["Day"].sort_values().tolist()
@@ -437,6 +622,12 @@ else:
     selected_day = st.sidebar.selectbox(
         "Day", ["Daily Summary"] + [str(day) for day in available_days]
     )
+
+    visible_dates = set(daily_data["EventDate"])
+
+    visible_events = meter_events[
+        meter_events["event_date"].isin(visible_dates)
+    ]
 
     # =============================================
     # DAILY VIEW
@@ -462,6 +653,14 @@ else:
         fig, ax = plt.subplots(figsize=(12, 5))
         style_chart(ax, fig)
     
+        event_dates = set(meter_events["event_date"].dt.normalize())
+        daily_data["EventDate"] = (
+            pd.to_datetime(daily_data["EventDate"])
+            .dt.normalize()
+        )
+
+        event_mask = daily_data["EventDate"].isin(event_dates)
+    
         x = np.arange(len(daily_data))
 
         actual_bars = ax.bar(
@@ -471,6 +670,8 @@ else:
             color="steelblue",
             label="Actual",
         )
+
+        plot_event_markers(ax, x, daily_data, event_mask)
 
         # Determine if prediction data is visible in this view
 
@@ -496,8 +697,23 @@ else:
 
         handles, labels = ax.get_legend_handles_labels()
 
+        if event_mask.any():
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    marker="^",
+                    markersize=10,
+                    markerfacecolor=EVENT_MARKER_COLOR,
+                    markeredgecolor="black",
+                    linestyle="None",
+                    label="Alert"
+                )
+            )
+            labels.append("Alert")
+
         if handles:
-            ax.legend()
+            ax.legend(handles, labels)
 
         ax.set_title(f"{aggregation_label} Usage by Day (kWh)")
 
@@ -521,6 +737,8 @@ else:
         plt.tight_layout()
 
         st.pyplot(fig)
+
+        display_event_table(visible_events)
 
     # =============================================
     # HOURLY VIEW
@@ -555,11 +773,24 @@ else:
                 )
         )
 
+        selected_date = pd.Timestamp(
+            year=selected_month_date.year,
+            month=selected_month_date.month,
+            day=selected_day
+        )
+
+        day_events = meter_events[
+            meter_events["event_date"] == selected_date.normalize()
+        ]
+
         # Ensure all 24 hours are displayed even if readings are missing
 
         all_hours = pd.DataFrame({"Hour": list(range(24))})
 
         hourly_data = all_hours.merge(hourly_data, on="Hour", how="left").fillna(0)
+        
+        event_hours = set(day_events["start_time"].dt.hour)
+        event_mask = hourly_data["Hour"].isin(event_hours)
 
         # ------------------------------------------------
         # Format Chart
@@ -586,6 +817,8 @@ else:
             label="Actual",
         )
 
+        plot_event_markers(ax, x, hourly_data, event_mask)
+
         # Determine if prediction data is visible in this view
 
         pred_mask = (
@@ -610,8 +843,23 @@ else:
 
         handles, labels = ax.get_legend_handles_labels()
 
+        if event_mask.any():
+            handles.append(
+                Line2D(
+                    [],
+                    [],
+                    marker="^",
+                    markersize=10,
+                    markerfacecolor=EVENT_MARKER_COLOR,
+                    markeredgecolor="black",
+                    linestyle="None",
+                    label="Alert"
+                )
+            )
+            labels.append("Alert")
+
         if handles:
-            ax.legend()
+            ax.legend(handles, labels)
 
         ax.set_title(f"{aggregation_label} Usage (kWh)")
 
@@ -635,3 +883,5 @@ else:
         plt.tight_layout()
 
         st.pyplot(fig)
+
+        display_event_table(visible_events)
