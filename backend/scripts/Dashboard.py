@@ -57,6 +57,15 @@ def display_kpis(df, usage_col):
     kpi2.metric("Average Hourly Usage (kWh)", f"{avg_usage:,.2f}")
     kpi3.metric("Peak Reading (kWh)", f"{max_usage:,.2f}")
     kpi4.metric("Readings", f"{reading_count:,}")
+    
+def style_chart(ax, fig):
+    fig.patch.set_facecolor("#DCDCDC")
+    ax.set_facecolor("#F7F7F7")
+
+    ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
 
 # ----------------------------------------------------
 # COLUMN DEFINITIONS
@@ -128,9 +137,7 @@ predicted_df = con.execute("""
     SELECT DISTINCT
         meterid,
         readingtime,
-        predictedvalue,
-        is_anomalous,
-        severity
+        predictedvalue
     FROM meter_readings
     WHERE predictedvalue IS NOT NULL
 """).fetch_df()
@@ -203,6 +210,12 @@ exclude_outliers = st.sidebar.checkbox(
     help="Removes unusually large readings that may be caused by bad meter data.",
 )
 
+show_predictions = st.sidebar.checkbox(
+    "Display Prediction Overlay",
+    value=True,
+    help="Display predicted usage values alongside actual readings."
+)
+
 # Add logo, title, and subheaders
 
 display_column = f"{aggregation_label} Usage (kWh)"
@@ -224,9 +237,7 @@ df["Hour"] = pd.to_datetime(df[date_col]).dt.floor("h")
 
 df = df.groupby(["sitename", "Hour"], as_index=False).agg(
     Total_Usage=("readingvalue", "sum"),
-    Predicted_Usage=("predictedvalue", "sum"),
-    is_anomalous=("is_anomalous", "any"),
-    severity=("severity", "max")
+    Predicted_Usage=("predictedvalue", "sum")
 )
 
 df = df.rename(columns={"Hour": date_col})
@@ -277,9 +288,7 @@ else:
         .groupby("Month", as_index=False)
         .agg(
             Usage=(usage_col, agg_function),
-            Predicted=(pred_col, agg_function),
-            Is_Anomalous=("is_anomalous", "any"),
-            Severity=("severity", "max")
+            Predicted=(pred_col, agg_function)
         )
     )
 
@@ -321,15 +330,8 @@ if selected_month_label == "Monthly Summary":
     st.subheader(f"{aggregation_label} Energy Usage" f" ({selected_utility})")
 
     fig, ax = plt.subplots(figsize=(12, 5))
-
-    fig.patch.set_facecolor("#DCDCDC")
-    ax.set_facecolor("#F7F7F7")
-
-    ax.grid(axis="y", linestyle="--", alpha=0.3)
-
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-
+    style_chart(ax, fig)
+    
     x = np.arange(len(monthly_data))
     width = 0.4
 
@@ -351,7 +353,7 @@ if selected_month_label == "Monthly Summary":
         label="Actual",
     )
 
-    if pred_mask.any():
+    if show_predictions and pred_mask.any():
         predicted_bars = ax.bar(
             x[pred_mask] + width / 2,
             monthly_data.loc[pred_mask, "Predicted"],
@@ -426,9 +428,7 @@ else:
         .groupby("Day", as_index=False)
         .agg(
             Usage=(usage_col, agg_function),
-            Predicted=(pred_col, agg_function),
-            Is_Anomalous=("is_anomalous", "any"),
-            Severity=("severity", "max")
+            Predicted=(pred_col, agg_function)
             )
     )
 
@@ -460,7 +460,8 @@ else:
         )
 
         fig, ax = plt.subplots(figsize=(12, 5))
-
+        style_chart(ax, fig)
+    
         x = np.arange(len(daily_data))
 
         actual_bars = ax.bar(
@@ -479,7 +480,7 @@ else:
             & (daily_data["Predicted"] != daily_data["Usage"])
         )
 
-        if pred_mask.any():
+        if show_predictions and pred_mask.any():
             ax.plot(
                 x[pred_mask],
                 daily_data.loc[pred_mask, "Predicted"],
@@ -490,20 +491,6 @@ else:
                 label="Predicted",
             )
             
-        anom_mask = daily_data["Is_Anomalous"]
-        offset = daily_data["Usage"].max() * 0.03
-
-        if anom_mask.any():
-            ax.scatter(
-                x[anom_mask],
-                daily_data.loc[anom_mask, "Usage"] - offset,
-                color="red",
-                marker="^",
-                s=150,
-                label="Anomaly",
-                zorder=5
-            )
-
         ax.set_xticks(x)
         ax.set_xticklabels(daily_data["Day"])
 
@@ -564,9 +551,7 @@ else:
             .groupby("Hour", as_index=False)
             .agg(
                 Usage=(usage_col, agg_function),
-                Predicted=(pred_col, agg_function),
-                Is_Anomalous=("is_anomalous", "any"),
-                Severity=("severity", "max")
+                Predicted=(pred_col, agg_function)
                 )
         )
 
@@ -589,6 +574,7 @@ else:
         )
 
         fig, ax = plt.subplots(figsize=(12, 5))
+        style_chart(ax, fig)
 
         x = np.arange(len(hourly_data))
 
@@ -608,7 +594,7 @@ else:
             & (hourly_data["Predicted"] != hourly_data["Usage"])
         )
 
-        if pred_mask.any():
+        if show_predictions and pred_mask.any():
             ax.plot(
                 x[pred_mask],
                 hourly_data.loc[pred_mask, "Predicted"],
@@ -617,20 +603,6 @@ else:
                 marker="o",
                 markersize=6,
                 label="Predicted",
-            )
-
-        anom_mask = hourly_data["Is_Anomalous"].fillna(False).astype(bool)
-        offset = hourly_data["Usage"].max() * 0.03
-
-        if anom_mask.any():
-            ax.scatter(
-                x[anom_mask],
-                hourly_data.loc[anom_mask, "Usage"] - offset,
-                color="red",
-                marker="^",
-                s=150,
-                label="Anomaly",
-                zorder=5
             )
 
         ax.set_xticks(x)
